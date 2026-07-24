@@ -1,0 +1,5 @@
+h3
+shapely
+fastapi
+uvicorn[standard]
+psycopg2-binary

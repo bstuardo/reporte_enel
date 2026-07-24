@@ -1,0 +1,29 @@
+# Credenciales reales (usar enel_las_condes_secrets.example.bat como plantilla)
+enel_las_condes_secrets.bat
+
+# Salidas generadas por el script (se regeneran en cada corrida)
+enel_las_condes_eventos_activos.csv
+enel_las_condes_eventos_historico.csv
+enel_las_condes_log.txt
+enel_las_condes_task_log.txt
+enel_las_condes_bat_error.log
+
+# Bases de datos locales (SQLite antiguo, respaldos)
+enel_las_condes.db
+enel_las_condes.db.bak_pre_migracion
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Entornos virtuales, por si se crea alguno mas adelante
+.venv/
+venv/
+
+# Configuracion local de Claude Code (especifica de este equipo/usuario)
+.claude/
+
+# Archivos de bloqueo de LibreOffice/Excel al tener un CSV abierto
+.~lock.*#
