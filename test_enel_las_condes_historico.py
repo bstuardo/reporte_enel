@@ -18,7 +18,7 @@ Cubren:
 """
 
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from shapely.geometry import Point
@@ -1067,3 +1067,105 @@ def test_main_replica_trafos_descargos_estado_a_supabase(
     assert trafo == ("NP-SUPA",)
     assert descargo == ("ND-SUPA",)
     assert estado == ("27/07 10:00", 5)
+
+
+# ----------------------------------------------------------------------
+# Fase 3: verificacion de integridad y purga del historico
+# ----------------------------------------------------------------------
+
+def test_verificar_integridad_db_sin_faltantes(conn):
+    assert mod.verificar_integridad_db(conn) == []
+
+
+def test_verificar_integridad_db_detecta_tabla_faltante(conn):
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE estado_sistema RENAME TO estado_sistema_temp")
+    conn.commit()
+    try:
+        faltantes = mod.verificar_integridad_db(conn)
+        assert "estado_sistema" in faltantes
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE estado_sistema_temp RENAME TO estado_sistema")
+        conn.commit()
+
+
+def test_purgar_historico_elimina_filas_viejas_pero_conserva_recientes(conn):
+    vieja = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d %H:%M:%S")
+    reciente = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+    mod.upsert_evento(conn, vieja, "EVT-VIEJO", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    mod.upsert_evento(conn, reciente, "EVT-RECIENTE", _props(), "h3b", True, -70.6, -33.4, 1, "2", "900002", "ID-BBB")
+    conn.commit()
+
+    eliminadas = mod.purgar_historico(conn, dias_retencion=90)
+
+    assert eliminadas == 1
+    assert _fetchone(conn, "SELECT COUNT(*) FROM historico_versiones WHERE cod_evento='EVT-VIEJO'")[0] == 0
+    assert _fetchone(conn, "SELECT COUNT(*) FROM historico_versiones WHERE cod_evento='EVT-RECIENTE'")[0] == 1
+    # las tablas resumen (estado actual) no se tocan aunque el evento sea viejo
+    assert _fetchone(conn, "SELECT COUNT(*) FROM eventos WHERE cod_evento='EVT-VIEJO'")[0] == 1
+
+
+def test_purgar_historico_purga_trafos_y_descargos_tambien(conn):
+    vieja = (datetime.now() - timedelta(days=100)).strftime("%Y-%m-%d %H:%M:%S")
+    mod.upsert_trafo(conn, vieja, "NP-VIEJO", _props_trafo(), "h3a", True, -70.6, -33.4, 1, "")
+    mod.upsert_descargo(conn, vieja, "ND-VIEJO", _props_descargo(), "h3a", True, -70.6, -33.4, 1, "")
+    conn.commit()
+
+    mod.purgar_historico(conn, dias_retencion=90)
+
+    assert _fetchone(conn, "SELECT COUNT(*) FROM trafos_versiones WHERE numpos='NP-VIEJO'")[0] == 0
+    assert _fetchone(conn, "SELECT COUNT(*) FROM descargos_versiones WHERE numpos='ND-VIEJO'")[0] == 0
+    # las tablas resumen conservan su fila actual
+    assert _fetchone(conn, "SELECT COUNT(*) FROM trafos_afectados WHERE numpos='NP-VIEJO'")[0] == 1
+    assert _fetchone(conn, "SELECT COUNT(*) FROM descargos_programados WHERE numpos='ND-VIEJO'")[0] == 1
+
+
+def test_purgar_historico_usa_retencion_por_defecto_configurable(conn, monkeypatch):
+    monkeypatch.setattr(mod, "RETENCION_DIAS_HISTORICO", 1)
+    vieja = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S")
+    mod.upsert_evento(conn, vieja, "EVT-VIEJO-2", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    conn.commit()
+
+    eliminadas = mod.purgar_historico(conn)  # sin argumento: usa RETENCION_DIAS_HISTORICO
+
+    assert eliminadas == 1
+
+
+def test_main_sale_con_codigo_de_error_si_falla_la_verificacion_de_integridad(monkeypatch):
+    def _conectar_falla():
+        raise RuntimeError("db caida")
+
+    monkeypatch.setattr(mod, "conectar_db", _conectar_falla)
+
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main()
+    assert exc_info.value.code != 0
+
+
+def test_main_purga_historico_como_parte_de_la_corrida(monkeypatch, tmp_path, punto_dentro):
+    """Confirma que main() efectivamente invoca la purga (no solo que la
+    funcion funcione aislada): una fila vieja preexistente debe desaparecer
+    despues de una corrida normal."""
+    lon, lat = punto_dentro
+    feed = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-CORRIDA", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed)
+
+    vieja = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d %H:%M:%S")
+    c = mod.conectar_db()
+    mod.upsert_evento(c, vieja, "EVT-YA-VIEJO", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    c.commit()
+    c.close()
+
+    mod.main()
+
+    c = mod.conectar_db()
+    n = _fetchone(c, "SELECT COUNT(*) FROM historico_versiones WHERE cod_evento='EVT-YA-VIEJO'")[0]
+    c.close()
+    assert n == 0  # la purga corrio como parte de main()

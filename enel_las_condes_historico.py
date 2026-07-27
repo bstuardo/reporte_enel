@@ -61,7 +61,7 @@ import shutil
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import h3
@@ -108,6 +108,12 @@ URL_ESTADO_TEMPLATE = "https://mapaemergencia.enel.com/galeria/documento/me-capa
 H3_RESOLUCION = 8  # debe coincidir con la resolucion de H3_LasCondes_Res8.geojson
 
 NOMBRE_COMUNA_FILTRO = "Las Condes"
+
+# RNF-07: retencion de las tablas de snapshots crudos (*_versiones). Las
+# tablas de resumen (eventos, trafos_afectados, descargos_programados)
+# NO se purgan nunca: conservan el estado/resumen actual de cada uno,
+# independiente de su antiguedad.
+RETENCION_DIAS_HISTORICO = int(os.environ.get("ENEL_RETENCION_DIAS_HISTORICO", "90"))
 
 # ----------------------------------------------------------------------
 # LOGGING
@@ -604,6 +610,58 @@ def insertar_estado_sistema(conn, snapshot_ts, datos, porcentaje):
         )
 
 
+TABLAS_ESPERADAS = (
+    "eventos", "historico_versiones",
+    "trafos_afectados", "trafos_versiones",
+    "descargos_programados", "descargos_versiones",
+    "estado_sistema",
+)
+
+
+def verificar_integridad_db(conn):
+    """Verificacion simple de integridad al inicio de la corrida: confirma
+    que las tablas esperadas existen y son consultables. No reemplaza a
+    init_db (que las crea si faltan) - esto es una lectura de diagnostico,
+    pensada para detectar temprano un problema de esquema antes de gastar
+    tiempo descargando los 4 feeds de Enel."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+        existentes = {r[0] for r in cur.fetchall()}
+    faltantes = [t for t in TABLAS_ESPERADAS if t not in existentes]
+    if faltantes:
+        logging.warning(
+            "Verificacion de integridad: faltan las tablas %s (init_db las creara)", faltantes
+        )
+    else:
+        logging.info("Verificacion de integridad: las %d tablas esperadas existen", len(TABLAS_ESPERADAS))
+    return faltantes
+
+
+def purgar_historico(conn, dias_retencion=None):
+    """RNF-07: evita que las tablas de snapshots crudos crezcan sin limite
+    corriendo cada 30 min de forma indefinida. Borra de historico_versiones/
+    trafos_versiones/descargos_versiones las filas mas viejas que
+    `dias_retencion` dias; las tablas de resumen (eventos, trafos_afectados,
+    descargos_programados) NO se tocan, conservan su fila actual siempre."""
+    if dias_retencion is None:
+        dias_retencion = RETENCION_DIAS_HISTORICO
+    corte = (datetime.now() - timedelta(days=dias_retencion)).strftime("%Y-%m-%d %H:%M:%S")
+
+    total = 0
+    with conn.cursor() as cur:
+        for tabla in ("historico_versiones", "trafos_versiones", "descargos_versiones"):
+            cur.execute(f"DELETE FROM {tabla} WHERE snapshot_ts < %s", (corte,))
+            total += cur.rowcount
+    conn.commit()
+
+    if total:
+        logging.info(
+            "Purga de historico: %d filas eliminadas (retencion %d dias, corte=%s)",
+            total, dias_retencion, corte,
+        )
+    return total
+
+
 # ----------------------------------------------------------------------
 # EXPORTS PARA POWER BI
 # ----------------------------------------------------------------------
@@ -837,6 +895,20 @@ def copiar_csv_a_onedrive():
 def main():
     snapshot_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     logging.info("=== Ejecucion iniciada (%s) ===", snapshot_ts)
+
+    # Verificacion de integridad simple, antes de gastar tiempo descargando
+    # los 4 feeds de Enel: confirma que la base local esta accesible y las
+    # tablas esperadas existen (init_db las crea si es la primera corrida).
+    try:
+        conn_check = conectar_db()
+        try:
+            init_db(conn_check)
+            verificar_integridad_db(conn_check)
+        finally:
+            conn_check.close()
+    except Exception as e:
+        logging.error("No se pudo verificar la base de datos local antes de iniciar la corrida: %s", e)
+        sys.exit(1)
 
     poligono_comunal = cargar_poligono_comunal()
     malla_h3_referencia = cargar_malla_h3()
@@ -1075,6 +1147,12 @@ def _aplicar_corrida(conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
         insertar_estado_sistema(conn, snapshot_ts, *estado_row)
 
     conn.commit()
+
+    try:
+        purgar_historico(conn)
+    except Exception as e:
+        logging.error("Fallo la purga de historico (no afecta los datos de esta corrida): %s", e)
+
     return n_resueltos, n_resueltos_trafos, n_resueltos_descargos
 
 
