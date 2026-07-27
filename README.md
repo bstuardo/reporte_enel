@@ -180,19 +180,19 @@ reimplementar los joins:
 | `vw_duracion_cortes` | Vista | Horas de duración (`fecha_ini` → `fecha_resolucion_detectada`) de cada aviso ya resuelto, por `alimentador` — base del ranking de duración |
 | `vw_mapa_h3` | Vista | `vw_cortes_unificado` (solo activos) agregado por `h3_index` vía `dim_h3`: total de clientes afectados y conteo por tipo de fuente, por hexágono — un registro por hexágono, listo para mapear |
 
-**Nota:** este Superset (Docker, imagen oficial sin plugins extra) no
-trae instalado el soporte de mapas geográficos (deck.gl/Mapbox), así que
-el dashboard usa una tabla ordenada por `clientes_afectados_total` en vez
-de un mapa interactivo real para `vw_mapa_h3`. El dato y el modelo están
-listos para un mapa de verdad apenas se habilite ese plugin (o se abra
-directo en Power BI, que sí soporta mapas nativos con lat/lon).
+**Mapa geográfico:** este Superset (Docker) sí trae los plugins de
+mapas (deck.gl + MapLibre/Carto, sin necesitar token de Mapbox — el
+renderer por defecto usa mosaicos abiertos de Carto/OpenStreetMap). El
+chart de mapa usa el tipo **deck.gl Scatterplot** sobre `vw_mapa_h3`:
+un punto por hexágono, en su centroide real, con tamaño proporcional a
+`clientes_afectados_total`.
 
 ### Dashboard en Superset
 
 `Reporte Enel Las Condes - Modelo Relacional` (`/superset/dashboard/reporte-enel-modelo-relacional/`):
 - **Serie de tiempo — clientes afectados**: `vw_cortes_unificado`, `SUM(clientes_afectados)` por día, desglosado por `tipo_fuente`.
 - **Ranking de duración de cortes por alimentador**: `vw_duracion_cortes`, promedio de `horas_duracion` por `alimentador`, descendente.
-- **Mapa por H3Index — clientes afectados por hexágono**: `vw_mapa_h3`, ordenado por `clientes_afectados_total`.
+- **Mapa por H3Index — clientes afectados por hexágono**: `vw_mapa_h3`, deck.gl Scatterplot sobre el centroide de cada hexágono, tamaño = clientes afectados.
 
 Datasets registrados en Superset (conexión "Postgres Local - Enel Las
 Condes"): `vw_cortes_unificado`, `vw_trafos_con_aviso`,
