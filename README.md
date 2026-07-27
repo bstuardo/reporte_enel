@@ -162,6 +162,42 @@ Mismas columnas que el anterior, más:
 | Activo | calculado | 1 mientras el `numpos` siga apareciendo en el feed |
 | EstadoTemporal | calculado (RF-07) | `futuro` / `en_curso` / `finalizado`, comparando la ventana horaria contra el momento del reporte |
 
+## Modelo relacional para visualización (Fase 4)
+
+Los 3 feeds geográficos (avisos, trafos, descargos) comparten dos claves
+naturales — `INCIDENCIA`/`COD_EVENTO` y `h3_index` — pero viven en tablas
+separadas. `crear_vistas()` y `poblar_dim_h3()` (llamadas cada corrida,
+en Postgres local y en la réplica de Supabase) arman el modelo relacional
+sobre esas claves, para que Power BI o Superset lo consuman directo sin
+reimplementar los joins:
+
+| Objeto | Tipo | Contenido |
+|---|---|---|
+| `dim_h3` | Tabla (dimensión) | Un registro por hexágono H3 usado en cualquiera de los 3 feeds o en la malla de referencia, con su centroide (`lat`/`lon` via `h3.cell_to_latlng`) y si pertenece a la malla oficial |
+| `vw_trafos_con_aviso` | Vista | `trafos_afectados` + los campos del aviso de origen (`falla`, `desc_evento`, `fecha_ini`) cruzados por `INCIDENCIA = cod_evento` |
+| `vw_descargos_con_aviso` | Vista | Mismo cruce, para `descargos_programados` |
+| `vw_cortes_unificado` | Vista (UNION ALL) | Los 3 feeds normalizados a un solo "hecho": `tipo_fuente` (`AVISO`/`TRAFO`/`DESCARGO`), `identificador`, `incidencia`, `h3_index`, `lat`/`lon`, `clientes_afectados`, `direcciones`, `fecha_inicio`, `activo` — la fuente para mapas y series de tiempo cruzados entre feeds |
+| `vw_duracion_cortes` | Vista | Horas de duración (`fecha_ini` → `fecha_resolucion_detectada`) de cada aviso ya resuelto, por `alimentador` — base del ranking de duración |
+| `vw_mapa_h3` | Vista | `vw_cortes_unificado` (solo activos) agregado por `h3_index` vía `dim_h3`: total de clientes afectados y conteo por tipo de fuente, por hexágono — un registro por hexágono, listo para mapear |
+
+**Nota:** este Superset (Docker, imagen oficial sin plugins extra) no
+trae instalado el soporte de mapas geográficos (deck.gl/Mapbox), así que
+el dashboard usa una tabla ordenada por `clientes_afectados_total` en vez
+de un mapa interactivo real para `vw_mapa_h3`. El dato y el modelo están
+listos para un mapa de verdad apenas se habilite ese plugin (o se abra
+directo en Power BI, que sí soporta mapas nativos con lat/lon).
+
+### Dashboard en Superset
+
+`Reporte Enel Las Condes - Modelo Relacional` (`/superset/dashboard/reporte-enel-modelo-relacional/`):
+- **Serie de tiempo — clientes afectados**: `vw_cortes_unificado`, `SUM(clientes_afectados)` por día, desglosado por `tipo_fuente`.
+- **Ranking de duración de cortes por alimentador**: `vw_duracion_cortes`, promedio de `horas_duracion` por `alimentador`, descendente.
+- **Mapa por H3Index — clientes afectados por hexágono**: `vw_mapa_h3`, ordenado por `clientes_afectados_total`.
+
+Datasets registrados en Superset (conexión "Postgres Local - Enel Las
+Condes"): `vw_cortes_unificado`, `vw_trafos_con_aviso`,
+`vw_descargos_con_aviso`, `vw_duracion_cortes`, `vw_mapa_h3`, `dim_h3`.
+
 ## API (FastAPI)
 
 `uvicorn enel_las_condes_api:app --host 0.0.0.0 --port 8000` — ver

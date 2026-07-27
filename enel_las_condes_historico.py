@@ -771,6 +771,20 @@ def crear_vistas(conn):
             WHERE activo = 0
               AND fecha_resolucion_detectada IS NOT NULL
               AND fecha_ini ~ '^\\d{2}-\\d{2}-\\d{4} \\d{2}:\\d{2}$';
+
+            CREATE OR REPLACE VIEW vw_mapa_h3 AS
+            SELECT
+                c.h3_index,
+                d.lat, d.lon, d.en_malla_referencia,
+                COUNT(*) AS n_registros,
+                COALESCE(SUM(c.clientes_afectados), 0) AS clientes_afectados_total,
+                SUM(CASE WHEN c.tipo_fuente = 'AVISO' THEN 1 ELSE 0 END) AS n_avisos,
+                SUM(CASE WHEN c.tipo_fuente = 'TRAFO' THEN 1 ELSE 0 END) AS n_trafos,
+                SUM(CASE WHEN c.tipo_fuente = 'DESCARGO' THEN 1 ELSE 0 END) AS n_descargos
+            FROM vw_cortes_unificado c
+            JOIN dim_h3 d ON d.h3_index = c.h3_index
+            WHERE c.activo = 1
+            GROUP BY c.h3_index, d.lat, d.lon, d.en_malla_referencia;
             """
         )
     conn.commit()

@@ -1279,6 +1279,41 @@ def test_crear_vistas_vw_duracion_cortes_ignora_activos(conn):
     assert _fetchone(conn, "SELECT COUNT(*) FROM vw_duracion_cortes WHERE identificador='EVT-ACTIVO-DUR'")[0] == 0
 
 
+def test_crear_vistas_vw_mapa_h3_agrega_por_hexagono(conn, punto_dentro):
+    lon, lat = punto_dentro
+    h3_index = mod.h3_de_punto(lat, lon)
+
+    mod.upsert_evento(conn, "t1", "EVT-MAPA-1", _props(), h3_index, True, lon, lat, 3, "1,2,3", "900001", "ID-AAA")
+    mod.upsert_trafo(conn, "t1", "NP-MAPA-1", _props_trafo(), h3_index, True, lon, lat, 2, "")
+    conn.commit()
+
+    mod.poblar_dim_h3(conn)
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(
+        conn,
+        "SELECT n_registros, clientes_afectados_total, n_avisos, n_trafos FROM vw_mapa_h3 WHERE h3_index=%s",
+        (h3_index,),
+    )
+    assert fila == (2, 5, 1, 1)
+
+
+def test_crear_vistas_vw_mapa_h3_ignora_inactivos(conn, punto_dentro):
+    lon, lat = punto_dentro
+    h3_index = mod.h3_de_punto(lat, lon)
+
+    mod.upsert_evento(conn, "t1", "EVT-MAPA-2", _props(), h3_index, True, lon, lat, 1, "1", "900001", "ID-AAA")
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "eventos", "cod_evento", set(), "t2")
+    conn.commit()
+
+    mod.poblar_dim_h3(conn)
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT COUNT(*) FROM vw_mapa_h3 WHERE h3_index=%s", (h3_index,))
+    assert fila[0] == 0
+
+
 def test_main_pobla_dim_h3_y_crea_vistas(monkeypatch, tmp_path, punto_dentro):
     """Confirma que main() efectivamente invoca dim_h3/vistas como parte
     normal de la corrida, no solo que las funciones aisladas funcionen."""
