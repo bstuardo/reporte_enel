@@ -435,6 +435,15 @@ def init_db(conn):
                 enel_datos TEXT,
                 porcentaje INTEGER
             );
+
+            -- Dimension H3 (Fase 4 - modelo relacional para visualizacion):
+            -- un registro por hexagono, compartido por los 3 feeds
+            CREATE TABLE IF NOT EXISTS dim_h3 (
+                h3_index TEXT PRIMARY KEY,
+                lat DOUBLE PRECISION,
+                lon DOUBLE PRECISION,
+                en_malla_referencia BOOLEAN
+            );
             """
         )
         # Defensivo: si la tabla ya existia de una version anterior del
@@ -614,7 +623,7 @@ TABLAS_ESPERADAS = (
     "eventos", "historico_versiones",
     "trafos_afectados", "trafos_versiones",
     "descargos_programados", "descargos_versiones",
-    "estado_sistema",
+    "estado_sistema", "dim_h3",
 )
 
 
@@ -660,6 +669,111 @@ def purgar_historico(conn, dias_retencion=None):
             total, dias_retencion, corte,
         )
     return total
+
+
+def poblar_dim_h3(conn):
+    """Dimension H3 (modelo relacional, Fase 4): un registro por cada
+    hexagono que aparece en cualquiera de los 3 feeds, mas los de la malla
+    de referencia, con su centroide precalculado (h3.cell_to_latlng) para
+    que Superset/Power BI puedan mapear por H3Index sin recalcularlo."""
+    malla = cargar_malla_h3()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT h3_index FROM eventos WHERE h3_index IS NOT NULL
+            UNION SELECT h3_index FROM trafos_afectados WHERE h3_index IS NOT NULL
+            UNION SELECT h3_index FROM descargos_programados WHERE h3_index IS NOT NULL
+            """
+        )
+        usados = {r[0] for r in cur.fetchall()}
+
+    nuevos = 0
+    with conn.cursor() as cur:
+        for h3_index in usados | malla:
+            try:
+                lat, lon = h3.cell_to_latlng(h3_index)
+            except Exception:
+                continue
+            cur.execute(
+                """
+                INSERT INTO dim_h3 (h3_index, lat, lon, en_malla_referencia)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT (h3_index) DO UPDATE SET en_malla_referencia = EXCLUDED.en_malla_referencia
+                """,
+                (h3_index, lat, lon, h3_index in malla),
+            )
+            nuevos += 1
+    conn.commit()
+    return nuevos
+
+
+def crear_vistas(conn):
+    """Modelo relacional para visualizacion (Fase 4): vistas que unen los
+    3 feeds via INCIDENCIA/COD_EVENTO (RF-05) y exponen un "hecho" unificado
+    por h3_index, para que Power BI o Superset construyan mapas, series de
+    tiempo y rankings sin reimplementar los joins en cada herramienta.
+    CREATE OR REPLACE VIEW: idempotente, seguro de correr cada corrida."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE OR REPLACE VIEW vw_trafos_con_aviso AS
+            SELECT
+                t.numpos, t.incidencia, t.tipo, t.tension, t.id_alim, t.h3_index,
+                t.en_malla_h3_referencia, t.lon, t.lat, t.fecha_inicio, t.estadoinc,
+                t.fecha_reposicion, t.direcciones, t.clientes_afectados,
+                t.primera_vez_visto, t.ultima_vez_visto, t.activo, t.fecha_resolucion_detectada,
+                e.falla AS aviso_falla, e.desc_evento AS aviso_descripcion, e.fecha_ini AS aviso_fecha_ini
+            FROM trafos_afectados t
+            LEFT JOIN eventos e ON e.cod_evento = t.incidencia;
+
+            CREATE OR REPLACE VIEW vw_descargos_con_aviso AS
+            SELECT
+                d.numpos, d.incidencia, d.tipo, d.tension, d.id_alim, d.h3_index,
+                d.en_malla_h3_referencia, d.lon, d.lat, d.descargo_codigo,
+                d.fecha_inidesc, d.fecha_findesc, d.cli_plan, d.estadodesc, d.fecha_reposicion,
+                d.direcciones, d.clientes_afectados, d.primera_vez_visto, d.ultima_vez_visto,
+                d.activo, d.fecha_resolucion_detectada,
+                e.falla AS aviso_falla, e.desc_evento AS aviso_descripcion, e.fecha_ini AS aviso_fecha_ini
+            FROM descargos_programados d
+            LEFT JOIN eventos e ON e.cod_evento = d.incidencia;
+
+            CREATE OR REPLACE VIEW vw_cortes_unificado AS
+            SELECT
+                'AVISO' AS tipo_fuente, cod_evento AS identificador, cod_evento AS incidencia,
+                h3_index, lat, lon, clientes_afectados, direccion AS direcciones,
+                fecha_ini AS fecha_inicio, fecha_reposicion_estimada, activo,
+                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada
+            FROM eventos
+            UNION ALL
+            SELECT
+                'TRAFO', numpos, incidencia, h3_index, lat, lon, clientes_afectados,
+                direcciones, fecha_inicio, fecha_reposicion, activo,
+                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada
+            FROM trafos_afectados
+            UNION ALL
+            SELECT
+                'DESCARGO', numpos, incidencia, h3_index, lat, lon, clientes_afectados,
+                direcciones, fecha_inidesc, fecha_reposicion, activo,
+                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada
+            FROM descargos_programados;
+
+            CREATE OR REPLACE VIEW vw_duracion_cortes AS
+            SELECT
+                cod_evento AS identificador,
+                id_alim AS alimentador,
+                fecha_ini,
+                fecha_resolucion_detectada,
+                EXTRACT(EPOCH FROM (
+                    to_timestamp(fecha_resolucion_detectada, 'YYYY-MM-DD HH24:MI:SS')
+                    - to_timestamp(fecha_ini, 'DD-MM-YYYY HH24:MI')
+                )) / 3600.0 AS horas_duracion
+            FROM eventos
+            WHERE activo = 0
+              AND fecha_resolucion_detectada IS NOT NULL
+              AND fecha_ini ~ '^\\d{2}-\\d{2}-\\d{4} \\d{2}:\\d{2}$';
+            """
+        )
+    conn.commit()
 
 
 # ----------------------------------------------------------------------
@@ -1147,6 +1261,16 @@ def _aplicar_corrida(conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
         insertar_estado_sistema(conn, snapshot_ts, *estado_row)
 
     conn.commit()
+
+    try:
+        poblar_dim_h3(conn)
+    except Exception as e:
+        logging.error("Fallo poblar la dimension H3 (no afecta los datos de esta corrida): %s", e)
+
+    try:
+        crear_vistas(conn)
+    except Exception as e:
+        logging.error("Fallo crear/actualizar las vistas del modelo relacional: %s", e)
 
     try:
         purgar_historico(conn)

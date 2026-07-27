@@ -172,7 +172,7 @@ def _execute(conn, sql, params=None):
 def conn():
     c = mod.conectar_db()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, dim_h3")
     c.commit()
     yield c
     c.close()
@@ -378,7 +378,9 @@ def test_migracion_agrega_columnas_sin_perder_datos_existentes():
     c = mod.conectar_db()
     try:
         with c.cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS eventos, historico_versiones")
+            # CASCADE: vw_cortes_unificado/vw_trafos_con_aviso/vw_descargos_con_aviso
+            # dependen de "eventos", si existen de una corrida anterior de tests
+            cur.execute("DROP TABLE IF EXISTS eventos, historico_versiones CASCADE")
             cur.execute(
                 """
                 CREATE TABLE eventos (
@@ -424,6 +426,7 @@ def test_migracion_agrega_columnas_sin_perder_datos_existentes():
         assert row == ("Direccion vieja", None, None, None)  # dato viejo intacto, columnas nuevas en NULL
     finally:
         mod.init_db(c)  # deja el esquema completo listo para el resto de los tests
+        mod.crear_vistas(c)  # las vistas se perdieron con el CASCADE, se recrean
         c.close()
 
 
@@ -440,7 +443,7 @@ def _preparar_main(monkeypatch, tmp_path, feed):
 
     c = mod.conectar_db()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, dim_h3")
     c.commit()
     c.close()
 
@@ -606,7 +609,7 @@ def _preparar_supabase_falsa(monkeypatch):
 
     c = mod.conectar_supabase()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, dim_h3")
     c.commit()
     c.close()
 
@@ -1169,3 +1172,131 @@ def test_main_purga_historico_como_parte_de_la_corrida(monkeypatch, tmp_path, pu
     n = _fetchone(c, "SELECT COUNT(*) FROM historico_versiones WHERE cod_evento='EVT-YA-VIEJO'")[0]
     c.close()
     assert n == 0  # la purga corrio como parte de main()
+
+
+# ----------------------------------------------------------------------
+# Fase 4: modelo relacional (dim_h3 + vistas)
+# ----------------------------------------------------------------------
+
+def test_poblar_dim_h3_incluye_malla_y_h3_usados(conn):
+    mod.upsert_evento(conn, "t1", "EVT-1", _props(), "h3-evento-test", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    conn.commit()
+
+    mod.poblar_dim_h3(conn)
+
+    malla = mod.cargar_malla_h3()
+    algun_hex_malla = next(iter(malla))
+    assert _fetchone(conn, "SELECT en_malla_referencia FROM dim_h3 WHERE h3_index=%s", (algun_hex_malla,))[0] is True
+
+    # el h3_index del evento no esta en la malla oficial, pero igual debe quedar en la dimension
+    fila = _fetchone(conn, "SELECT lat, lon, en_malla_referencia FROM dim_h3 WHERE h3_index='h3-evento-test'")
+    assert fila is None  # "h3-evento-test" no es un h3_index real, cell_to_latlng falla y se omite
+
+
+def test_poblar_dim_h3_calcula_centroide_real(conn, punto_dentro):
+    lon, lat = punto_dentro
+    h3_index = mod.h3_de_punto(lat, lon)
+    mod.upsert_evento(conn, "t1", "EVT-1", _props(), h3_index, True, lon, lat, 1, "1", "900001", "ID-AAA")
+    conn.commit()
+
+    mod.poblar_dim_h3(conn)
+
+    fila = _fetchone(conn, "SELECT lat, lon FROM dim_h3 WHERE h3_index=%s", (h3_index,))
+    assert fila is not None
+    assert fila[0] == pytest.approx(lat, abs=0.01)
+    assert fila[1] == pytest.approx(lon, abs=0.01)
+
+
+def test_crear_vistas_vw_trafos_con_aviso_cruza_por_incidencia(conn):
+    mod.upsert_evento(conn, "t1", "EVT-CRUCE", _props(FALLA="Falla de prueba"), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    mod.upsert_trafo(conn, "t1", "NP-1", _props_trafo(INCIDENCIA="EVT-CRUCE"), "h3a", True, -70.6, -33.4, 1, "Calle A")
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT aviso_falla FROM vw_trafos_con_aviso WHERE numpos='NP-1'")
+    assert fila == ("Falla de prueba",)
+
+
+def test_crear_vistas_vw_trafos_con_aviso_sin_match_devuelve_null(conn):
+    mod.upsert_trafo(conn, "t1", "NP-2", _props_trafo(INCIDENCIA="SIN-AVISO"), "h3a", True, -70.6, -33.4, 1, "")
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT aviso_falla FROM vw_trafos_con_aviso WHERE numpos='NP-2'")
+    assert fila == (None,)
+
+
+def test_crear_vistas_vw_descargos_con_aviso(conn):
+    mod.upsert_evento(conn, "t1", "EVT-D", _props(DESC_EVENTO="desc de prueba"), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    mod.upsert_descargo(conn, "t1", "ND-1", _props_descargo(INCIDENCIA="EVT-D"), "h3a", True, -70.6, -33.4, 1, "Calle B")
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT aviso_descripcion FROM vw_descargos_con_aviso WHERE numpos='ND-1'")
+    assert fila == ("desc de prueba",)
+
+
+def test_crear_vistas_vw_cortes_unificado_incluye_los_3_feeds(conn):
+    mod.upsert_evento(conn, "t1", "EVT-U", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    mod.upsert_trafo(conn, "t1", "NP-U", _props_trafo(), "h3a", True, -70.6, -33.4, 1, "")
+    mod.upsert_descargo(conn, "t1", "ND-U", _props_descargo(), "h3a", True, -70.6, -33.4, 1, "")
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    filas = _fetchall(
+        conn,
+        "SELECT tipo_fuente, identificador FROM vw_cortes_unificado "
+        "WHERE identificador IN ('EVT-U', 'NP-U', 'ND-U') ORDER BY tipo_fuente",
+    )
+    assert filas == [("AVISO", "EVT-U"), ("DESCARGO", "ND-U"), ("TRAFO", "NP-U")]
+
+
+def test_crear_vistas_vw_duracion_cortes_calcula_horas(conn):
+    mod.upsert_evento(
+        conn, "2026-07-27 12:00:00", "EVT-DUR",
+        _props(FECHA_INI="27-07-2026 08:00"), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA",
+    )
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "eventos", "cod_evento", set(), "2026-07-27 12:00:00")
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT horas_duracion FROM vw_duracion_cortes WHERE identificador='EVT-DUR'")
+    assert fila == (4.0,)  # 08:00 -> 12:00
+
+
+def test_crear_vistas_vw_duracion_cortes_ignora_activos(conn):
+    mod.upsert_evento(conn, "t1", "EVT-ACTIVO-DUR", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA")
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    assert _fetchone(conn, "SELECT COUNT(*) FROM vw_duracion_cortes WHERE identificador='EVT-ACTIVO-DUR'")[0] == 0
+
+
+def test_main_pobla_dim_h3_y_crea_vistas(monkeypatch, tmp_path, punto_dentro):
+    """Confirma que main() efectivamente invoca dim_h3/vistas como parte
+    normal de la corrida, no solo que las funciones aisladas funcionen."""
+    lon, lat = punto_dentro
+    feed = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-MODELO", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed)
+
+    mod.main()
+
+    c = mod.conectar_db()
+    fila_unificada = _fetchone(c, "SELECT tipo_fuente FROM vw_cortes_unificado WHERE identificador='EVT-MODELO'")
+    h3_index = _fetchone(c, "SELECT h3_index FROM eventos WHERE cod_evento='EVT-MODELO'")[0]
+    en_dim_h3 = _fetchone(c, "SELECT COUNT(*) FROM dim_h3 WHERE h3_index=%s", (h3_index,))[0]
+    c.close()
+    assert fila_unificada == ("AVISO",)
+    assert en_dim_h3 == 1
