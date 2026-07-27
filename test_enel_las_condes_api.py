@@ -36,7 +36,10 @@ def _crear_db():
     conn = psycopg2.connect(**TEST_DB_CONFIG)
     historico.init_db(conn)
     with conn.cursor() as cur:
-        cur.execute("TRUNCATE eventos, historico_versiones")
+        cur.execute(
+            "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, "
+            "descargos_programados, descargos_versiones, estado_sistema"
+        )
     conn.commit()
 
     historico.upsert_evento(
@@ -55,6 +58,26 @@ def _crear_db():
     )
     conn.commit()
     historico.marcar_resueltos(conn, {"EVT-1"}, "2026-07-22 09:00:00")  # EVT-2 queda resuelto
+    conn.commit()
+
+    historico.upsert_trafo(
+        conn, "2026-07-27 09:00:00", "NP-1",
+        {"TIPO": "TRAFO", "TENSION": "MT", "INCIDENCIA": "DF-T1", "id_alim": "500",
+         "FECHA_INICIO": "27-07-2026 08:00", "ESTADOINC": "Activo", "FECHA_REPOSICION": "27-07-2026 13:00"},
+        "88b2c5199", True, -70.58, -33.41, 12, "Los Alamos 123",
+    )
+    conn.commit()
+
+    historico.upsert_descargo(
+        conn, "2026-07-27 09:00:00", "ND-1",
+        {"TIPO": "DESCARGO", "TENSION": "MT", "INCIDENCIA": "DF-D1", "id_alim": "600",
+         "DESCARGO": "DF-D1(TP1)", "FECHA_INIDESC": "22-07-2026 05:00", "FECHA_FINDESC": "22-07-2026 09:00",
+         "CLI_PLAN": "1", "ESTADODESC": "789", "FECHA_REPOSICION": "22-07-2026 09:00"},
+        "88b2c5198", True, -70.56, -33.42, 4, "Manquehue 500",
+    )
+    conn.commit()
+
+    historico.insertar_estado_sistema(conn, "2026-07-22 08:00:00", "22/07 08:00", 7)
     conn.commit()
     conn.close()
 
@@ -187,3 +210,58 @@ def test_eventos_activos_sin_base_de_datos_devuelve_503():
         resp = c.get("/eventos/activos")
     api.app.dependency_overrides.clear()
     assert resp.status_code == 503
+
+
+# ----------------------------------------------------------------------
+# Feed 2/3/4: trafos, descargos, estado
+# ----------------------------------------------------------------------
+
+def test_trafos_activos_devuelve_los_datos_esperados(client):
+    resp = client.get("/trafos/activos")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    fila = data[0]
+    assert fila["NumPos"] == "NP-1"
+    assert fila["Incidencia"] == "DF-T1"
+    assert fila["Direcciones"] == "Los Alamos 123"
+    assert fila["ClientesAfectados"] == 12
+    assert fila["EstadoIncidencia"] == "Activo"
+
+
+def test_descargos_sin_filtro_devuelve_todos(client):
+    resp = client.get("/descargos")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["NumPos"] == "ND-1"
+    assert data[0]["DescargoCodigo"] == "DF-D1(TP1)"
+
+
+def test_descargos_filtrado_por_activo(client):
+    resp = client.get("/descargos", params={"activo": "true"})
+    assert {d["NumPos"] for d in resp.json()} == {"ND-1"}
+    resp_falso = client.get("/descargos", params={"activo": "false"})
+    assert resp_falso.json() == []
+
+
+def test_descargos_incluye_estado_temporal_calculado(client, monkeypatch):
+    monkeypatch.setattr(api, "datetime", _FakeDatetime)  # ahora fija: 2026-07-22 12:00:00
+    resp = client.get("/descargos")
+    fila = resp.json()[0]
+    assert fila["EstadoTemporal"] == "finalizado"  # 05:00-09:00 ya paso respecto a las 12:00
+
+
+def test_estado_devuelve_la_corrida_mas_reciente_primero(client):
+    resp = client.get("/estado")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["Datos"] == "22/07 08:00"
+    assert data[0]["Porcentaje"] == 7
+
+
+def test_estado_respeta_el_limite(client):
+    resp = client.get("/estado", params={"limit": 1})
+    assert resp.status_code == 200
+    assert len(resp.json()) <= 1

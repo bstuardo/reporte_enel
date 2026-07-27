@@ -18,11 +18,16 @@ Correr localmente:
     uvicorn enel_las_condes_api:app --host 0.0.0.0 --port 8000
 
 Endpoints:
-    GET /health                        -> estado del servicio y de la BD
-    GET /eventos/activos                -> eventos activos (igual que el CSV de activos)
-    GET /eventos/historico               -> historico completo (igual que el CSV historico)
+    GET /health                          -> estado del servicio y de la BD
+    GET /eventos/activos                 -> avisos activos (igual que el CSV de activos)
+    GET /eventos/historico                -> avisos, historico completo (igual que el CSV historico)
+                                              ?activo=true|false para filtrar
+    GET /eventos/{cod_evento}/versiones  -> snapshots historicos de un aviso puntual
+    GET /trafos/activos                  -> transformadores afectados activos (feed 2)
+    GET /descargos                       -> descargos programados (feed 3)
                                              ?activo=true|false para filtrar
-    GET /eventos/{cod_evento}/versiones -> snapshots historicos de un evento puntual
+    GET /estado                          -> historico del health-check de Enel (feed 4)
+                                             ?limit=N (default 100)
 """
 
 import os
@@ -97,6 +102,20 @@ def _horas_activo(fecha_ini_str, fin_dt):
     return round((fin_dt - fecha_ini).total_seconds() / 3600, 1)
 
 
+def _clasificar_descargo(fecha_inidesc_str, fecha_findesc_str, ahora):
+    """RF-07: futuro / en_curso / finalizado, comparando la ventana horaria
+    del descargo programado contra el momento de la consulta."""
+    inicio = _parsear_fecha_ini(fecha_inidesc_str)
+    fin = _parsear_fecha_ini(fecha_findesc_str)
+    if inicio is None or fin is None:
+        return None
+    if ahora < inicio:
+        return "futuro"
+    if ahora > fin:
+        return "finalizado"
+    return "en_curso"
+
+
 ACTIVOS_SQL = """
     SELECT
         cod_evento AS "CodigoEvento",
@@ -167,6 +186,63 @@ VERSIONES_SQL = """
     ORDER BY snapshot_ts
 """
 
+TRAFOS_ACTIVOS_SQL = """
+    SELECT
+        numpos AS "NumPos",
+        incidencia AS "Incidencia",
+        tipo AS "Tipo",
+        tension AS "Tension",
+        id_alim AS "Alimentador",
+        h3_index AS "H3Index",
+        en_malla_h3_referencia AS "EnMallaH3Referencia",
+        lat AS "Latitud",
+        lon AS "Longitud",
+        clientes_afectados AS "ClientesAfectados",
+        direcciones AS "Direcciones",
+        estadoinc AS "EstadoIncidencia",
+        fecha_inicio AS "FechaInicio",
+        fecha_reposicion AS "FechaReposicionEstimada",
+        primera_vez_visto AS "PrimeraVezVisto",
+        ultima_vez_visto AS "UltimaVezVisto"
+    FROM trafos_afectados
+    WHERE activo = 1
+    ORDER BY ultima_vez_visto DESC
+"""
+
+DESCARGOS_SQL_BASE = """
+    SELECT
+        numpos AS "NumPos",
+        incidencia AS "Incidencia",
+        descargo_codigo AS "DescargoCodigo",
+        tipo AS "Tipo",
+        tension AS "Tension",
+        id_alim AS "Alimentador",
+        h3_index AS "H3Index",
+        en_malla_h3_referencia AS "EnMallaH3Referencia",
+        lat AS "Latitud",
+        lon AS "Longitud",
+        clientes_afectados AS "ClientesAfectados",
+        direcciones AS "Direcciones",
+        estadodesc AS "EstadoDescargo",
+        fecha_inidesc AS "FechaInicioDescargo",
+        fecha_findesc AS "FechaFinDescargo",
+        fecha_reposicion AS "FechaReposicionEstimada",
+        primera_vez_visto AS "PrimeraVezVisto",
+        ultima_vez_visto AS "UltimaVezVisto",
+        activo AS "Activo"
+    FROM descargos_programados
+"""
+
+ESTADO_SQL = """
+    SELECT
+        snapshot_ts AS "SnapshotTs",
+        enel_datos AS "Datos",
+        porcentaje AS "Porcentaje"
+    FROM estado_sistema
+    ORDER BY snapshot_ts DESC
+    LIMIT %s
+"""
+
 
 @app.get("/")
 def raiz():
@@ -178,6 +254,9 @@ def raiz():
             "/eventos/activos",
             "/eventos/historico",
             "/eventos/{cod_evento}/versiones",
+            "/trafos/activos",
+            "/descargos",
+            "/estado",
         ],
     }
 
@@ -256,6 +335,61 @@ def evento_versiones(cod_evento: str, db_config: dict = Depends(get_db_config)) 
     try:
         with conn.cursor() as cur:
             cur.execute(VERSIONES_SQL, (cod_evento,))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+@app.get("/trafos/activos")
+def trafos_activos(db_config: dict = Depends(get_db_config)) -> List[dict]:
+    conn = _conectar(db_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(TRAFOS_ACTIVOS_SQL)
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+@app.get("/descargos")
+def descargos(
+    activo: Optional[bool] = Query(None, description="Filtrar por activo=true o activo=false"),
+    db_config: dict = Depends(get_db_config),
+) -> List[dict]:
+    sql = DESCARGOS_SQL_BASE
+    params: list = []
+    if activo is not None:
+        sql += " WHERE activo = %s"
+        params.append(1 if activo else 0)
+    sql += " ORDER BY fecha_inidesc DESC"
+
+    ahora = datetime.now()
+    conn = _conectar(db_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            filas = cur.fetchall()
+        resultado = []
+        for fila in filas:
+            fila = dict(fila)
+            fila["EstadoTemporal"] = _clasificar_descargo(
+                fila["FechaInicioDescargo"], fila["FechaFinDescargo"], ahora
+            )
+            resultado.append(fila)
+        return resultado
+    finally:
+        conn.close()
+
+
+@app.get("/estado")
+def estado_sistema(
+    limit: int = Query(100, ge=1, le=1000, description="Cantidad maxima de corridas a devolver"),
+    db_config: dict = Depends(get_db_config),
+) -> List[dict]:
+    conn = _conectar(db_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(ESTADO_SQL, (limit,))
             return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()

@@ -58,6 +58,34 @@ def punto_borde(poligono):
     return x, y  # lon, lat
 
 
+@pytest.fixture(scope="module")
+def geometria_polygon_dentro(punto_dentro):
+    """Geometria GeoJSON Polygon (para simular trafosAfectados/descargos, que
+    vienen como Polygon en vez de Point) cuyo representative_point cae
+    garantizado dentro del limite comunal."""
+    lon, lat = punto_dentro
+    d = 0.0005
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [lon - d, lat - d], [lon + d, lat - d],
+            [lon + d, lat + d], [lon - d, lat + d],
+            [lon - d, lat - d],
+        ]],
+    }
+
+
+@pytest.fixture(scope="module")
+def geometria_polygon_fuera():
+    """Poligono en pleno Oceano Pacifico, claramente fuera de cualquier comuna."""
+    return {
+        "type": "Polygon",
+        "coordinates": [[
+            [-75.0, -33.4], [-74.999, -33.4], [-74.999, -33.399], [-75.0, -33.399], [-75.0, -33.4],
+        ]],
+    }
+
+
 # ----------------------------------------------------------------------
 # Poligono comunal
 # ----------------------------------------------------------------------
@@ -144,7 +172,7 @@ def _execute(conn, sql, params=None):
 def conn():
     c = mod.conectar_db()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema")
     c.commit()
     yield c
     c.close()
@@ -412,7 +440,7 @@ def _preparar_main(monkeypatch, tmp_path, feed):
 
     c = mod.conectar_db()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema")
     c.commit()
     c.close()
 
@@ -556,3 +584,486 @@ def test_main_agrega_tipo_cod_avisos_e_ids_aviso_de_varios_clientes(monkeypatch,
     )
     c.close()
     assert row == ("AVISO", 2, "111,222", "ID-1,ID-2")
+
+
+# ----------------------------------------------------------------------
+# Replica en Supabase (best-effort, dual-write)
+# ----------------------------------------------------------------------
+# Se simula Supabase con una segunda base Postgres LOCAL (enel_las_condes_test_supabase),
+# distinta de la de "produccion de test" (enel_las_condes_test), para poder
+# verificar que la replica realmente escribe en una base separada, sin
+# depender de red ni de las credenciales reales de Supabase.
+
+TEST_SUPABASE_DB_NAME = "enel_las_condes_test_supabase"
+
+
+def _preparar_supabase_falsa(monkeypatch):
+    monkeypatch.setattr(mod, "SUPABASE_DB_HOST", mod.DB_HOST)
+    monkeypatch.setattr(mod, "SUPABASE_DB_PORT", mod.DB_PORT)
+    monkeypatch.setattr(mod, "SUPABASE_DB_NAME", TEST_SUPABASE_DB_NAME)
+    monkeypatch.setattr(mod, "SUPABASE_DB_USER", mod.DB_USER)
+    monkeypatch.setattr(mod, "SUPABASE_DB_PASSWORD", mod.DB_PASSWORD)
+
+    c = mod.conectar_supabase()
+    mod.init_db(c)
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema")
+    c.commit()
+    c.close()
+
+
+def test_main_replica_a_supabase_cuando_esta_configurado(monkeypatch, tmp_path, punto_dentro):
+    lon, lat = punto_dentro
+    feed = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-SUPA", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed)
+    _preparar_supabase_falsa(monkeypatch)
+
+    mod.main()
+
+    c_local = mod.conectar_db()
+    fila_local = _fetchone(c_local, "SELECT cod_evento FROM eventos WHERE cod_evento='EVT-SUPA'")
+    c_local.close()
+    assert fila_local == ("EVT-SUPA",)
+
+    c_supa = mod.conectar_supabase()
+    fila_supa = _fetchone(c_supa, "SELECT cod_evento FROM eventos WHERE cod_evento='EVT-SUPA'")
+    c_supa.close()
+    assert fila_supa == ("EVT-SUPA",)  # tambien llego a la "Supabase" (base separada)
+
+
+def test_main_sin_supabase_configurado_no_intenta_replicar(monkeypatch, tmp_path, punto_dentro):
+    lon, lat = punto_dentro
+    feed = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-SIN-SUPA", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed)
+    monkeypatch.setattr(mod, "SUPABASE_DB_HOST", "")  # default: sin configurar
+
+    mod.main()  # no debe lanzar ni intentar conectar a Supabase
+
+    c_local = mod.conectar_db()
+    fila_local = _fetchone(c_local, "SELECT cod_evento FROM eventos WHERE cod_evento='EVT-SIN-SUPA'")
+    c_local.close()
+    assert fila_local == ("EVT-SIN-SUPA",)
+
+
+def test_main_continua_si_supabase_no_responde(monkeypatch, tmp_path, punto_dentro):
+    """Si Supabase esta inalcanzable (host/puerto invalido, red caida, etc.)
+    la corrida local no debe verse afectada: la escritura local ya se hizo
+    antes de intentar la replica."""
+    lon, lat = punto_dentro
+    feed = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-SUPA-CAIDA", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed)
+    monkeypatch.setattr(mod, "SUPABASE_DB_HOST", "localhost")
+    monkeypatch.setattr(mod, "SUPABASE_DB_PORT", "59999")  # nada escuchando ahi
+
+    mod.main()  # no debe lanzar excepcion pese a que Supabase no responde
+
+    c_local = mod.conectar_db()
+    fila_local = _fetchone(c_local, "SELECT cod_evento FROM eventos WHERE cod_evento='EVT-SUPA-CAIDA'")
+    c_local.close()
+    assert fila_local == ("EVT-SUPA-CAIDA",)  # la corrida local se completo igual
+
+
+# ----------------------------------------------------------------------
+# Feed 2/3: filtro comunal para geometrias Polygon (trafosAfectados/descargos)
+# ----------------------------------------------------------------------
+
+def test_filtrar_por_comuna_poligonos_incluye_dentro_y_filtra_tipo(geometria_polygon_dentro, poligono):
+    malla = mod.cargar_malla_h3()
+    features = [
+        {"properties": {"TIPO": "TRAFO", "numpos": "1"}, "geometry": geometria_polygon_dentro},
+        {"properties": {"TIPO": "DESCARGO", "numpos": "2"}, "geometry": geometria_polygon_dentro},
+    ]
+    seleccionados = mod._filtrar_por_comuna_poligonos(features, "TRAFO", poligono, malla)
+    assert len(seleccionados) == 1
+    assert seleccionados[0][0]["properties"]["numpos"] == "1"
+
+
+def test_filtrar_por_comuna_poligonos_sin_filtro_tipo_acepta_todos(geometria_polygon_dentro, poligono):
+    malla = mod.cargar_malla_h3()
+    features = [{"properties": {"TIPO": "DESCARGO", "numpos": "1"}, "geometry": geometria_polygon_dentro}]
+    seleccionados = mod._filtrar_por_comuna_poligonos(features, None, poligono, malla)
+    assert len(seleccionados) == 1
+
+
+def test_filtrar_por_comuna_poligonos_descarta_fuera_de_la_comuna(geometria_polygon_fuera, poligono):
+    malla = mod.cargar_malla_h3()
+    features = [{"properties": {"TIPO": "TRAFO", "numpos": "1"}, "geometry": geometria_polygon_fuera}]
+    assert mod._filtrar_por_comuna_poligonos(features, "TRAFO", poligono, malla) == []
+
+
+def test_filtrar_por_comuna_poligonos_ignora_geometria_invalida(poligono):
+    malla = mod.cargar_malla_h3()
+    features = [{"properties": {"TIPO": "TRAFO", "numpos": "1"}, "geometry": None}]
+    assert mod._filtrar_por_comuna_poligonos(features, "TRAFO", poligono, malla) == []
+
+
+def test_filtrar_por_comuna_poligonos_calcula_h3(geometria_polygon_dentro, poligono):
+    malla = mod.cargar_malla_h3()
+    features = [{"properties": {"TIPO": "TRAFO", "numpos": "1"}, "geometry": geometria_polygon_dentro}]
+    seleccionados = mod._filtrar_por_comuna_poligonos(features, "TRAFO", poligono, malla)
+    _, h3_index, en_malla_ref, lon, lat = seleccionados[0]
+    assert h3_index is not None
+    assert en_malla_ref in (True, False)
+
+
+# ----------------------------------------------------------------------
+# RF-05: cruce de avisos (feed 1) con trafos/descargos via INCIDENCIA
+# ----------------------------------------------------------------------
+
+def test_consolidar_avisos_por_incidencia_agrupa_direcciones_y_clientes():
+    seleccionados_avisos = [
+        ({"properties": {"COD_EVENTO": "EVT-1", "DIRECCION": "Calle A", "numero_cliente": "1"}}, None, None, None, None),
+        ({"properties": {"COD_EVENTO": "EVT-1", "DIRECCION": "Calle B", "numero_cliente": "2"}}, None, None, None, None),
+        ({"properties": {"CODIGO": "EVT-2", "DIRECCION": "Calle C", "numero_cliente": "3"}}, None, None, None, None),
+    ]
+    consolidado = mod._consolidar_avisos_por_incidencia(seleccionados_avisos)
+    assert consolidado["EVT-1"]["direcciones"] == {"Calle A", "Calle B"}
+    assert consolidado["EVT-1"]["clientes"] == {"1", "2"}
+    assert consolidado["EVT-2"]["direcciones"] == {"Calle C"}
+
+
+def test_consolidar_avisos_por_incidencia_ignora_sin_cod_evento():
+    seleccionados_avisos = [({"properties": {"DIRECCION": "Calle A"}}, None, None, None, None)]
+    assert mod._consolidar_avisos_por_incidencia(seleccionados_avisos) == {}
+
+
+def test_clientes_afectados_poligono_prefiere_clitotal():
+    assert mod._clientes_afectados_poligono({"CLITOTAL": "390"}, {"1", "2"}) == 390
+
+
+def test_clientes_afectados_poligono_usa_fallback_si_clitotal_vacio():
+    assert mod._clientes_afectados_poligono({"CLITOTAL": ""}, {"1", "2", "3"}) == 3
+
+
+def test_clientes_afectados_poligono_usa_fallback_si_clitotal_no_numerico():
+    assert mod._clientes_afectados_poligono({"CLITOTAL": " "}, {"1"}) == 1
+
+
+def test_preparar_filas_polygon_cruza_con_avisos_por_incidencia():
+    seleccionados = [
+        ({"properties": {"numpos": "100", "INCIDENCIA": "EVT-1", "CLITOTAL": ""}}, "h3a", True, -70.5, -33.4),
+    ]
+    avisos_por_incidencia = {"EVT-1": {"direcciones": {"Calle A"}, "clientes": {"1", "2"}}}
+    filas = mod._preparar_filas_polygon(seleccionados, avisos_por_incidencia)
+    assert len(filas) == 1
+    numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones = filas[0]
+    assert numpos == "100"
+    assert direcciones == "Calle A"
+    assert clientes_afectados == 2
+
+
+def test_preparar_filas_polygon_descarta_sin_numpos():
+    seleccionados = [({"properties": {"INCIDENCIA": "EVT-1"}}, "h3a", True, -70.5, -33.4)]
+    assert mod._preparar_filas_polygon(seleccionados, {}) == []
+
+
+def test_clasificar_descargo_futuro_en_curso_finalizado():
+    ahora = datetime(2026, 7, 27, 15, 0, 0)
+    assert mod._clasificar_descargo("27-07-2026 16:00", "27-07-2026 18:00", ahora) == "futuro"
+    assert mod._clasificar_descargo("27-07-2026 14:00", "27-07-2026 18:00", ahora) == "en_curso"
+    assert mod._clasificar_descargo("27-07-2026 10:00", "27-07-2026 14:00", ahora) == "finalizado"
+    assert mod._clasificar_descargo(None, "27-07-2026 18:00", ahora) is None
+
+
+# ----------------------------------------------------------------------
+# Feed 2: tabla trafos_afectados
+# ----------------------------------------------------------------------
+
+def _props_trafo(**kwargs):
+    base = {
+        "TIPO": "TRAFO", "TENSION": "MT", "INCIDENCIA": "DF1", "id_alim": "100",
+        "FECHA_INICIO": "27-07-2026 09:00", "ESTADOINC": "Activo",
+        "FECHA_REPOSICION": "27-07-2026 13:00",
+    }
+    base.update(kwargs)
+    return base
+
+
+def test_upsert_trafo_inserta_nuevo(conn):
+    mod.upsert_trafo(conn, "2026-07-27 09:00:00", "NP-1", _props_trafo(), "h3a", True, -70.5, -33.4, 5, "Calle A,Calle B")
+    conn.commit()
+    row = _fetchone(
+        conn, "SELECT incidencia, estadoinc, clientes_afectados, direcciones, activo FROM trafos_afectados WHERE numpos='NP-1'"
+    )
+    assert row == ("DF1", "Activo", 5, "Calle A,Calle B", 1)
+    hist = _fetchone(conn, "SELECT COUNT(*) FROM trafos_versiones WHERE numpos='NP-1'")[0]
+    assert hist == 1
+
+
+def test_upsert_trafo_actualiza_estado_y_clientes_sin_duplicar(conn):
+    mod.upsert_trafo(conn, "t1", "NP-1", _props_trafo(ESTADOINC="Activo"), "h3a", True, -70.5, -33.4, 5, "Calle A")
+    mod.upsert_trafo(conn, "t2", "NP-1", _props_trafo(ESTADOINC="Resuelto"), "h3a", True, -70.5, -33.4, 8, "Calle A,Calle B")
+    conn.commit()
+    row = _fetchone(conn, "SELECT estadoinc, clientes_afectados, direcciones FROM trafos_afectados WHERE numpos='NP-1'")
+    assert row == ("Resuelto", 8, "Calle A,Calle B")
+    assert _fetchone(conn, "SELECT COUNT(*) FROM trafos_afectados")[0] == 1
+    assert _fetchone(conn, "SELECT COUNT(*) FROM trafos_versiones WHERE numpos='NP-1'")[0] == 2
+
+
+def test_marcar_resueltos_generico_aplica_a_trafos(conn):
+    mod.upsert_trafo(conn, "t1", "NP-1", _props_trafo(), "h3a", True, -70.5, -33.4, 1, "")
+    mod.upsert_trafo(conn, "t1", "NP-2", _props_trafo(), "h3b", True, -70.5, -33.4, 1, "")
+    conn.commit()
+    n = mod._marcar_resueltos_generico(conn, "trafos_afectados", "numpos", {"NP-1"}, "t2")
+    conn.commit()
+    assert n == 1
+    assert _fetchone(conn, "SELECT activo FROM trafos_afectados WHERE numpos='NP-2'")[0] == 0
+    assert _fetchone(conn, "SELECT activo FROM trafos_afectados WHERE numpos='NP-1'")[0] == 1
+
+
+def test_exportar_csv_trafos_escribe_solo_activos(conn, tmp_path, monkeypatch):
+    path = tmp_path / "trafos.csv"
+    monkeypatch.setattr(mod, "CSV_TRAFOS_ACTIVOS_PATH", path)
+    mod.upsert_trafo(conn, "t1", "NP-1", _props_trafo(), "h3a", True, -70.5, -33.4, 1, "Calle A")
+    mod.upsert_trafo(conn, "t1", "NP-2", _props_trafo(), "h3b", True, -70.5, -33.4, 1, "Calle B")
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "trafos_afectados", "numpos", {"NP-1"}, "t2")
+    conn.commit()
+
+    mod.exportar_csv_trafos(conn)
+
+    txt = path.read_text(encoding="utf-8-sig")
+    assert "NP-1" in txt
+    assert "NP-2" not in txt
+
+
+# ----------------------------------------------------------------------
+# Feed 3: tabla descargos_programados
+# ----------------------------------------------------------------------
+
+def _props_descargo(**kwargs):
+    base = {
+        "TIPO": "DESCARGO", "TENSION": "MT", "INCIDENCIA": "DF2", "id_alim": "200",
+        "DESCARGO": "DF2(TP1)", "FECHA_INIDESC": "27-07-2026 14:00", "FECHA_FINDESC": "27-07-2026 17:00",
+        "CLI_PLAN": "1", "ESTADODESC": "789", "FECHA_REPOSICION": "27-07-2026 17:00",
+    }
+    base.update(kwargs)
+    return base
+
+
+def test_upsert_descargo_inserta_nuevo(conn):
+    mod.upsert_descargo(conn, "2026-07-27 09:00:00", "ND-1", _props_descargo(), "h3a", True, -70.5, -33.4, 3, "Calle X")
+    conn.commit()
+    row = _fetchone(
+        conn,
+        "SELECT descargo_codigo, fecha_inidesc, fecha_findesc, clientes_afectados, activo "
+        "FROM descargos_programados WHERE numpos='ND-1'",
+    )
+    assert row == ("DF2(TP1)", "27-07-2026 14:00", "27-07-2026 17:00", 3, 1)
+    hist = _fetchone(conn, "SELECT COUNT(*) FROM descargos_versiones WHERE numpos='ND-1'")[0]
+    assert hist == 1
+
+
+def test_marcar_resueltos_generico_aplica_a_descargos(conn):
+    mod.upsert_descargo(conn, "t1", "ND-1", _props_descargo(), "h3a", True, -70.5, -33.4, 1, "")
+    conn.commit()
+    n = mod._marcar_resueltos_generico(conn, "descargos_programados", "numpos", set(), "t2")
+    conn.commit()
+    assert n == 1
+    assert _fetchone(conn, "SELECT activo FROM descargos_programados WHERE numpos='ND-1'")[0] == 0
+
+
+def test_exportar_csv_descargos_incluye_todos_y_clasifica(conn, tmp_path, monkeypatch):
+    path = tmp_path / "descargos.csv"
+    monkeypatch.setattr(mod, "CSV_DESCARGOS_PATH", path)
+    monkeypatch.setattr(mod, "datetime", _FakeDatetime)  # ahora fija: 2026-07-24 12:00:00
+
+    mod.upsert_descargo(
+        conn, "t1", "ND-1",
+        _props_descargo(FECHA_INIDESC="24-07-2026 06:00", FECHA_FINDESC="24-07-2026 10:00"),
+        "h3a", True, -70.5, -33.4, 1, "Calle A",
+    )
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "descargos_programados", "numpos", set(), "t2")
+    conn.commit()
+
+    mod.exportar_csv_descargos(conn)
+
+    filas = {r["NumPos"]: r for r in csv.DictReader(path.read_text(encoding="utf-8-sig").splitlines(), delimiter=";")}
+    assert filas["ND-1"]["EstadoTemporal"] == "finalizado"  # 06:00-10:00 ya paso respecto a las 12:00
+    assert filas["ND-1"]["Activo"] == "0"  # el CSV de descargos incluye tambien los ya inactivos
+
+
+# ----------------------------------------------------------------------
+# Feed 4: tabla estado_sistema
+# ----------------------------------------------------------------------
+
+def test_insertar_estado_sistema(conn):
+    mod.insertar_estado_sistema(conn, "2026-07-27 09:00:00", "27/07 09:00", 8)
+    conn.commit()
+    row = _fetchone(conn, "SELECT enel_datos, porcentaje FROM estado_sistema WHERE snapshot_ts='2026-07-27 09:00:00'")
+    assert row == ("27/07 09:00", 8)
+
+
+def test_insertar_estado_sistema_ignora_snapshot_duplicado(conn):
+    mod.insertar_estado_sistema(conn, "t1", "27/07 09:00", 8)
+    mod.insertar_estado_sistema(conn, "t1", "27/07 09:30", 9)  # mismo snapshot_ts que el anterior
+    conn.commit()
+    assert _fetchone(conn, "SELECT COUNT(*) FROM estado_sistema WHERE snapshot_ts='t1'")[0] == 1
+
+
+# ----------------------------------------------------------------------
+# main(): integracion de los 4 feeds (Fase 1 del documento de requerimientos)
+# ----------------------------------------------------------------------
+
+def test_main_integra_trafos_descargos_estado_con_cruce_de_avisos(
+    monkeypatch, tmp_path, punto_dentro, geometria_polygon_dentro
+):
+    """Extremo a extremo: un aviso y un trafo comparten INCIDENCIA/COD_EVENTO;
+    el trafo debe terminar con la direccion y los clientes del aviso (RF-05/06)."""
+    lon, lat = punto_dentro
+    feed_avisos = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "DF-CRUCE", "DIRECCION": "Los Alamos 123", "numero_cliente": "999"},
+        }]
+    }
+    feed_trafos = {
+        "features": [{
+            "properties": {
+                "numpos": "NP-CRUCE", "TIPO": "TRAFO", "TENSION": "MT", "INCIDENCIA": "DF-CRUCE",
+                "CLITOTAL": "", "id_alim": "500", "FECHA_INICIO": "27-07-2026 09:00",
+                "ESTADOINC": "Activo", "FECHA_REPOSICION": "27-07-2026 13:00",
+            },
+            "geometry": geometria_polygon_dentro,
+        }]
+    }
+    feed_descargos = {"features": []}
+    feed_estado = {"datos": "27/07 09:45", "porcentaje": 8}
+
+    _preparar_main(monkeypatch, tmp_path, feed_avisos)
+    monkeypatch.setattr(mod, "descargar_trafos", lambda: feed_trafos)
+    monkeypatch.setattr(mod, "descargar_descargos", lambda: feed_descargos)
+    monkeypatch.setattr(mod, "descargar_estado", lambda: feed_estado)
+
+    mod.main()
+
+    c = mod.conectar_db()
+    fila_trafo = _fetchone(
+        c, "SELECT incidencia, direcciones, clientes_afectados FROM trafos_afectados WHERE numpos='NP-CRUCE'"
+    )
+    fila_estado = _fetchone(c, "SELECT enel_datos, porcentaje FROM estado_sistema ORDER BY snapshot_ts DESC LIMIT 1")
+    c.close()
+    assert fila_trafo == ("DF-CRUCE", "Los Alamos 123", 1)
+    assert fila_estado == ("27/07 09:45", 8)
+
+
+def test_main_trafos_falla_no_marca_previos_como_resueltos(monkeypatch, tmp_path, punto_dentro):
+    """RNF-02: si el feed de trafos falla, no se toca la tabla esta
+    corrida (a diferencia de una lista vacia legitima, que si resolveria)."""
+    lon, lat = punto_dentro
+    feed_avisos = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-X", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed_avisos)
+
+    c = mod.conectar_db()
+    mod.upsert_trafo(c, "t0", "NP-PREVIO", _props_trafo(), "h3a", True, -70.6, -33.4, 1, "")
+    c.commit()
+    c.close()
+
+    def _falla_trafos():
+        raise RuntimeError("timeout simulado")
+
+    monkeypatch.setattr(mod, "descargar_trafos", _falla_trafos)
+    monkeypatch.setattr(mod, "descargar_descargos", lambda: {"features": []})
+    monkeypatch.setattr(mod, "descargar_estado", lambda: {"datos": "x", "porcentaje": 1})
+
+    mod.main()
+
+    c = mod.conectar_db()
+    activo = _fetchone(c, "SELECT activo FROM trafos_afectados WHERE numpos='NP-PREVIO'")[0]
+    c.close()
+    assert activo == 1  # el feed de trafos fallo: no debe marcarse como resuelto
+
+
+def test_main_trafos_vacio_top_level_no_marca_previos_como_resueltos(monkeypatch, tmp_path, punto_dentro):
+    """Mismo caso anterior, pero disparado por un feed vacio (0 registros en
+    todo Enel) en vez de una excepcion: tambien debe tratarse como fallo."""
+    lon, lat = punto_dentro
+    feed_avisos = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-Y", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed_avisos)
+
+    c = mod.conectar_db()
+    mod.upsert_trafo(c, "t0", "NP-PREVIO-2", _props_trafo(), "h3a", True, -70.6, -33.4, 1, "")
+    c.commit()
+    c.close()
+
+    monkeypatch.setattr(mod, "descargar_trafos", lambda: {"features": []})
+    monkeypatch.setattr(mod, "descargar_descargos", lambda: {"features": []})
+    monkeypatch.setattr(mod, "descargar_estado", lambda: {"datos": "x", "porcentaje": 1})
+
+    mod.main()
+
+    c = mod.conectar_db()
+    activo = _fetchone(c, "SELECT activo FROM trafos_afectados WHERE numpos='NP-PREVIO-2'")[0]
+    c.close()
+    assert activo == 1
+
+
+def test_main_replica_trafos_descargos_estado_a_supabase(
+    monkeypatch, tmp_path, punto_dentro, geometria_polygon_dentro
+):
+    lon, lat = punto_dentro
+    feed_avisos = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-SUPA-4F", "numero_cliente": "1"},
+        }]
+    }
+    feed_trafos = {
+        "features": [{
+            "properties": {
+                "numpos": "NP-SUPA", "TIPO": "TRAFO", "TENSION": "MT", "INCIDENCIA": "EVT-SUPA-4F",
+                "CLITOTAL": "5", "id_alim": "500", "FECHA_INICIO": "27-07-2026 09:00",
+                "ESTADOINC": "Activo", "FECHA_REPOSICION": "27-07-2026 13:00",
+            },
+            "geometry": geometria_polygon_dentro,
+        }]
+    }
+    feed_descargos = {
+        "features": [{
+            "properties": {**_props_descargo(), "numpos": "ND-SUPA", "INCIDENCIA": "EVT-SUPA-4F-DESC"},
+            "geometry": geometria_polygon_dentro,
+        }]
+    }
+    feed_estado = {"datos": "27/07 10:00", "porcentaje": 5}
+
+    _preparar_main(monkeypatch, tmp_path, feed_avisos)
+    _preparar_supabase_falsa(monkeypatch)
+    monkeypatch.setattr(mod, "descargar_trafos", lambda: feed_trafos)
+    monkeypatch.setattr(mod, "descargar_descargos", lambda: feed_descargos)
+    monkeypatch.setattr(mod, "descargar_estado", lambda: feed_estado)
+
+    mod.main()
+
+    c_supa = mod.conectar_supabase()
+    trafo = _fetchone(c_supa, "SELECT numpos FROM trafos_afectados WHERE numpos='NP-SUPA'")
+    descargo = _fetchone(c_supa, "SELECT numpos FROM descargos_programados WHERE numpos='ND-SUPA'")
+    estado = _fetchone(c_supa, "SELECT enel_datos, porcentaje FROM estado_sistema WHERE enel_datos='27/07 10:00'")
+    c_supa.close()
+    assert trafo == ("NP-SUPA",)
+    assert descargo == ("ND-SUPA",)
+    assert estado == ("27/07 10:00", 5)

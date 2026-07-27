@@ -4,6 +4,8 @@ enel_las_condes_secrets.bat
 # Salidas generadas por el script (se regeneran en cada corrida)
 enel_las_condes_eventos_activos.csv
 enel_las_condes_eventos_historico.csv
+enel_las_condes_trafos_activos.csv
+enel_las_condes_descargos.csv
 enel_las_condes_log.txt
 enel_las_condes_task_log.txt
 enel_las_condes_bat_error.log
