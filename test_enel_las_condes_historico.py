@@ -18,6 +18,7 @@ Cubren:
 """
 
 import csv
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -172,7 +173,7 @@ def _execute(conn, sql, params=None):
 def conn():
     c = mod.conectar_db()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, dim_h3")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, comuna_estado, dim_h3, dim_unidad_vecinal")
     c.commit()
     yield c
     c.close()
@@ -418,12 +419,12 @@ def test_migracion_agrega_columnas_sin_perder_datos_existentes():
                 "SELECT column_name FROM information_schema.columns WHERE table_name = 'eventos'"
             )
             columnas = {r[0] for r in cur.fetchall()}
-        assert {"tipo", "cod_avisos", "ids_aviso"} <= columnas
+        assert {"tipo", "cod_avisos", "ids_aviso", "unidad_vecinal"} <= columnas
 
         row = _fetchone(
-            c, "SELECT direccion, tipo, cod_avisos, ids_aviso FROM eventos WHERE cod_evento='EVT-VIEJO'"
+            c, "SELECT direccion, tipo, cod_avisos, ids_aviso, unidad_vecinal FROM eventos WHERE cod_evento='EVT-VIEJO'"
         )
-        assert row == ("Direccion vieja", None, None, None)  # dato viejo intacto, columnas nuevas en NULL
+        assert row == ("Direccion vieja", None, None, None, None)  # dato viejo intacto, columnas nuevas en NULL
     finally:
         mod.init_db(c)  # deja el esquema completo listo para el resto de los tests
         mod.crear_vistas(c)  # las vistas se perdieron con el CASCADE, se recrean
@@ -443,7 +444,7 @@ def _preparar_main(monkeypatch, tmp_path, feed):
 
     c = mod.conectar_db()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, dim_h3")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, comuna_estado, dim_h3, dim_unidad_vecinal")
     c.commit()
     c.close()
 
@@ -609,7 +610,7 @@ def _preparar_supabase_falsa(monkeypatch):
 
     c = mod.conectar_supabase()
     mod.init_db(c)
-    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, dim_h3")
+    _execute(c, "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, descargos_programados, descargos_versiones, estado_sistema, comuna_estado, dim_h3, dim_unidad_vecinal")
     c.commit()
     c.close()
 
@@ -763,10 +764,11 @@ def test_preparar_filas_polygon_cruza_con_avisos_por_incidencia():
     avisos_por_incidencia = {"EVT-1": {"direcciones": {"Calle A"}, "clientes": {"1", "2"}}}
     filas = mod._preparar_filas_polygon(seleccionados, avisos_por_incidencia)
     assert len(filas) == 1
-    numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones = filas[0]
+    numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones, unidad_vecinal = filas[0]
     assert numpos == "100"
     assert direcciones == "Calle A"
     assert clientes_afectados == 2
+    assert unidad_vecinal is None  # sin unidades_vecinales pasadas (default), no se puede clasificar
 
 
 def test_preparar_filas_polygon_descarta_sin_numpos():
@@ -844,6 +846,49 @@ def test_exportar_csv_trafos_escribe_solo_activos(conn, tmp_path, monkeypatch):
     assert "NP-2" not in txt
 
 
+def test_exportar_csv_trafos_historico_incluye_activos_y_resueltos(conn, tmp_path, monkeypatch):
+    path = tmp_path / "trafos_historico.csv"
+    monkeypatch.setattr(mod, "CSV_TRAFOS_HISTORICO_PATH", path)
+    mod.upsert_trafo(conn, "t1", "NP-1", _props_trafo(), "h3a", True, -70.5, -33.4, 1, "Calle A")
+    mod.upsert_trafo(conn, "t1", "NP-2", _props_trafo(), "h3b", True, -70.5, -33.4, 1, "Calle B")
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "trafos_afectados", "numpos", {"NP-1"}, "t2")
+    conn.commit()
+
+    mod.exportar_csv_trafos_historico(conn)
+
+    txt = path.read_text(encoding="utf-8-sig")
+    assert "NP-1" in txt
+    assert "NP-2" in txt  # el historico si conserva los resueltos
+    cabecera = txt.splitlines()[0]
+    assert "Activo" in cabecera
+    assert "FechaResolucionDetectada" in cabecera
+    assert "HorasActivo" in cabecera
+
+
+def test_exportar_csv_trafos_historico_calcula_horas_activo(conn, tmp_path, monkeypatch):
+    path = tmp_path / "trafos_historico.csv"
+    monkeypatch.setattr(mod, "CSV_TRAFOS_HISTORICO_PATH", path)
+    monkeypatch.setattr(mod, "datetime", _FakeDatetime)  # ahora fija: 2026-07-24 12:00:00
+
+    mod.upsert_trafo(
+        conn, "t1", "NP-RESUELTO", _props_trafo(FECHA_INICIO="24-07-2026 02:00"),
+        "h3a", True, -70.5, -33.4, 1, "Calle A",
+    )
+    conn.commit()
+    _execute(
+        conn,
+        "UPDATE trafos_afectados SET activo = 0, fecha_resolucion_detectada = %s WHERE numpos = 'NP-RESUELTO'",
+        ("2026-07-24 08:00:00",),
+    )
+    conn.commit()
+
+    mod.exportar_csv_trafos_historico(conn)
+
+    filas = {r["NumPos"]: r for r in csv.DictReader(path.read_text(encoding="utf-8-sig").splitlines(), delimiter=";")}
+    assert filas["NP-RESUELTO"]["HorasActivo"] == "6.0"  # 02:00 -> 08:00 (resolucion), no hasta las 12:00
+
+
 # ----------------------------------------------------------------------
 # Feed 3: tabla descargos_programados
 # ----------------------------------------------------------------------
@@ -899,6 +944,36 @@ def test_exportar_csv_descargos_incluye_todos_y_clasifica(conn, tmp_path, monkey
     filas = {r["NumPos"]: r for r in csv.DictReader(path.read_text(encoding="utf-8-sig").splitlines(), delimiter=";")}
     assert filas["ND-1"]["EstadoTemporal"] == "finalizado"  # 06:00-10:00 ya paso respecto a las 12:00
     assert filas["ND-1"]["Activo"] == "0"  # el CSV de descargos incluye tambien los ya inactivos
+
+
+def test_exportar_csv_descargos_activos_solo_incluye_los_activos(conn, tmp_path, monkeypatch):
+    path = tmp_path / "descargos_activos.csv"
+    monkeypatch.setattr(mod, "CSV_DESCARGOS_ACTIVOS_PATH", path)
+    monkeypatch.setattr(mod, "datetime", _FakeDatetime)  # ahora fija: 2026-07-24 12:00:00
+
+    mod.upsert_descargo(
+        conn, "t1", "ND-ACTIVO",
+        _props_descargo(FECHA_INIDESC="24-07-2026 10:00", FECHA_FINDESC="24-07-2026 14:00"),
+        "h3a", True, -70.5, -33.4, 1, "Calle A",
+    )
+    mod.upsert_descargo(
+        conn, "t1", "ND-RESUELTO",
+        _props_descargo(FECHA_INIDESC="24-07-2026 06:00", FECHA_FINDESC="24-07-2026 10:00"),
+        "h3b", True, -70.5, -33.4, 1, "Calle B",
+    )
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "descargos_programados", "numpos", {"ND-ACTIVO"}, "t2")
+    conn.commit()
+
+    mod.exportar_csv_descargos_activos(conn)
+
+    txt = path.read_text(encoding="utf-8-sig")
+    assert "ND-ACTIVO" in txt
+    assert "ND-RESUELTO" not in txt
+
+    filas = {r["NumPos"]: r for r in csv.DictReader(txt.splitlines(), delimiter=";")}
+    assert filas["ND-ACTIVO"]["EstadoTemporal"] == "en_curso"  # 10:00-14:00 incluye las 12:00
+    assert "Activo" not in filas["ND-ACTIVO"]  # igual que trafos_activos: se omite, siempre seria 1
 
 
 # ----------------------------------------------------------------------
@@ -1335,3 +1410,296 @@ def test_main_pobla_dim_h3_y_crea_vistas(monkeypatch, tmp_path, punto_dentro):
     c.close()
     assert fila_unificada == ("AVISO",)
     assert en_dim_h3 == 1
+
+
+# ----------------------------------------------------------------------
+# Fase 4: unidades vecinales (barrio) - Unidades_Vecinales_LasCondes.geojson
+# ----------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def unidades_vecinales():
+    return mod.cargar_unidades_vecinales()
+
+
+@pytest.fixture(scope="module")
+def punto_en_unidad_vecinal(unidades_vecinales):
+    """Punto garantizado dentro de una unidad vecinal (representative_point
+    de su poligono), junto con el codigo que deberia asignarsele."""
+    codigo, _, poligono = unidades_vecinales[0]
+    p = poligono.representative_point()
+    return p.x, p.y, codigo  # lon, lat, codigo
+
+
+def test_cargar_unidades_vecinales_devuelve_las_25(unidades_vecinales):
+    assert len(unidades_vecinales) == 25
+
+
+def test_cargar_unidades_vecinales_codigos_unicos_formato_c_n(unidades_vecinales):
+    codigos = {codigo for codigo, _, _ in unidades_vecinales}
+    assert codigos == {f"C-{n}" for n in range(1, 26)}
+
+
+def test_cargar_unidades_vecinales_poligonos_validos(unidades_vecinales):
+    for _, _, poligono in unidades_vecinales:
+        assert poligono.is_valid
+        assert poligono.area > 0
+
+
+def test_unidad_vecinal_de_punto_dentro_devuelve_su_codigo(unidades_vecinales, punto_en_unidad_vecinal):
+    lon, lat, codigo_esperado = punto_en_unidad_vecinal
+    assert mod.unidad_vecinal_de_punto(lat, lon, unidades_vecinales) == codigo_esperado
+
+
+def test_unidad_vecinal_de_punto_fuera_devuelve_none(unidades_vecinales):
+    # Punto en pleno Oceano Pacifico, claramente fuera de cualquier barrio
+    assert mod.unidad_vecinal_de_punto(-33.4, -75.0, unidades_vecinales) is None
+
+
+def test_preparar_filas_calcula_unidad_vecinal(unidades_vecinales, punto_en_unidad_vecinal):
+    lon, lat, codigo_esperado = punto_en_unidad_vecinal
+    seleccionados = [({"properties": {"COD_EVENTO": "EVT-1"}}, "h3a", True, lon, lat)]
+    filas = mod._preparar_filas(seleccionados, {}, {}, {}, unidades_vecinales)
+    assert len(filas) == 1
+    assert filas[0][-1] == codigo_esperado
+
+
+def test_preparar_filas_sin_unidades_vecinales_devuelve_none():
+    seleccionados = [({"properties": {"COD_EVENTO": "EVT-1"}}, "h3a", True, -70.6, -33.4)]
+    filas = mod._preparar_filas(seleccionados, {}, {}, {})
+    assert filas[0][-1] is None
+
+
+def test_preparar_filas_polygon_calcula_unidad_vecinal(unidades_vecinales, punto_en_unidad_vecinal):
+    lon, lat, codigo_esperado = punto_en_unidad_vecinal
+    seleccionados = [({"properties": {"numpos": "1", "INCIDENCIA": "EVT-1"}}, "h3a", True, lon, lat)]
+    filas = mod._preparar_filas_polygon(seleccionados, {}, unidades_vecinales)
+    assert filas[0][-1] == codigo_esperado
+
+
+def test_upsert_evento_guarda_unidad_vecinal(conn):
+    mod.upsert_evento(
+        conn, "t1", "EVT-UV", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA",
+        "C-4",
+    )
+    conn.commit()
+    assert _fetchone(conn, "SELECT unidad_vecinal FROM eventos WHERE cod_evento='EVT-UV'") == ("C-4",)
+    assert _fetchone(conn, "SELECT unidad_vecinal FROM historico_versiones WHERE cod_evento='EVT-UV'") == ("C-4",)
+
+
+def test_upsert_trafo_guarda_unidad_vecinal(conn):
+    mod.upsert_trafo(
+        conn, "t1", "NP-UV", _props_trafo(), "h3a", True, -70.6, -33.4, 1, "", unidad_vecinal="C-5",
+    )
+    conn.commit()
+    assert _fetchone(conn, "SELECT unidad_vecinal FROM trafos_afectados WHERE numpos='NP-UV'") == ("C-5",)
+    assert _fetchone(conn, "SELECT unidad_vecinal FROM trafos_versiones WHERE numpos='NP-UV'") == ("C-5",)
+
+
+def test_upsert_descargo_guarda_unidad_vecinal(conn):
+    mod.upsert_descargo(
+        conn, "t1", "ND-UV", _props_descargo(), "h3a", True, -70.6, -33.4, 1, "", unidad_vecinal="C-6",
+    )
+    conn.commit()
+    assert _fetchone(conn, "SELECT unidad_vecinal FROM descargos_programados WHERE numpos='ND-UV'") == ("C-6",)
+    assert _fetchone(conn, "SELECT unidad_vecinal FROM descargos_versiones WHERE numpos='ND-UV'") == ("C-6",)
+
+
+def test_poblar_dim_unidad_vecinal_inserta_las_25(conn):
+    n = mod.poblar_dim_unidad_vecinal(conn)
+    assert n == 25
+    assert _fetchone(conn, "SELECT COUNT(*) FROM dim_unidad_vecinal")[0] == 25
+
+
+def test_poblar_dim_unidad_vecinal_punto_de_referencia_cae_dentro_del_poligono(conn, unidades_vecinales):
+    mod.poblar_dim_unidad_vecinal(conn)
+    codigo, numero, poligono = unidades_vecinales[0]
+
+    fila = _fetchone(
+        conn, "SELECT numero, lat, lon, geometria_geojson FROM dim_unidad_vecinal WHERE codigo=%s", (codigo,)
+    )
+    assert fila is not None
+    numero_db, lat, lon, geometria_geojson = fila
+    assert numero_db == numero
+    assert poligono.covers(Point(lon, lat))
+
+    geom = json.loads(geometria_geojson)
+    assert geom["type"] == "Polygon"
+
+
+def test_crear_vistas_vw_cortes_unificado_incluye_unidad_vecinal(conn):
+    mod.upsert_evento(
+        conn, "t1", "EVT-UV-VISTA", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA", "C-7",
+    )
+    conn.commit()
+
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT unidad_vecinal FROM vw_cortes_unificado WHERE identificador='EVT-UV-VISTA'")
+    assert fila == ("C-7",)
+
+
+def test_crear_vistas_vw_mapa_unidad_vecinal_agrega_por_barrio(conn):
+    mod.upsert_evento(
+        conn, "t1", "EVT-UV-1", _props(), "h3a", True, -70.6, -33.4, 3, "1,2,3", "900001", "ID-AAA", "C-8",
+    )
+    mod.upsert_trafo(conn, "t1", "NP-UV-1", _props_trafo(), "h3a", True, -70.6, -33.4, 2, "", unidad_vecinal="C-8")
+    conn.commit()
+
+    mod.poblar_dim_unidad_vecinal(conn)
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(
+        conn,
+        "SELECT n_registros, clientes_afectados_total, n_avisos, n_trafos "
+        "FROM vw_mapa_unidad_vecinal WHERE unidad_vecinal=%s",
+        ("C-8",),
+    )
+    assert fila == (2, 5, 1, 1)
+
+
+def test_crear_vistas_vw_mapa_unidad_vecinal_ignora_inactivos(conn):
+    mod.upsert_evento(
+        conn, "t1", "EVT-UV-2", _props(), "h3a", True, -70.6, -33.4, 1, "1", "900001", "ID-AAA", "C-9",
+    )
+    conn.commit()
+    mod._marcar_resueltos_generico(conn, "eventos", "cod_evento", set(), "t2")
+    conn.commit()
+
+    mod.poblar_dim_unidad_vecinal(conn)
+    mod.crear_vistas(conn)
+
+    fila = _fetchone(conn, "SELECT COUNT(*) FROM vw_mapa_unidad_vecinal WHERE unidad_vecinal=%s", ("C-9",))
+    assert fila[0] == 0
+
+
+def test_main_asigna_unidad_vecinal_a_eventos(monkeypatch, tmp_path, punto_borde, unidades_vecinales):
+    """Confirma que main() efectivamente clasifica por barrio como parte
+    normal de la corrida, no solo que las funciones aisladas funcionen."""
+    lon, lat = punto_borde
+    codigo_esperado = mod.unidad_vecinal_de_punto(lat, lon, unidades_vecinales)
+    assert codigo_esperado is not None  # sanity: el punto de prueba cae dentro de un barrio
+
+    feed = {
+        "features": [{
+            "geometry": {"coordinates": [lon, lat]},
+            "properties": {**_props(), "COD_EVENTO": "EVT-BARRIO", "numero_cliente": "1"},
+        }]
+    }
+    _preparar_main(monkeypatch, tmp_path, feed)
+
+    mod.main()
+
+    c = mod.conectar_db()
+    fila = _fetchone(c, "SELECT unidad_vecinal FROM eventos WHERE cod_evento='EVT-BARRIO'")
+    en_dim = _fetchone(c, "SELECT COUNT(*) FROM dim_unidad_vecinal WHERE codigo=%s", (codigo_esperado,))[0]
+    n_registros_mapa = _fetchone(
+        c, "SELECT n_registros FROM vw_mapa_unidad_vecinal WHERE unidad_vecinal=%s", (codigo_esperado,)
+    )[0]
+    c.close()
+    assert fila == (codigo_esperado,)
+    assert en_dim == 1
+    assert n_registros_mapa >= 1
+
+
+# ----------------------------------------------------------------------
+# Feed 5: resumen de la comuna (me-capa-comunasAfectadas.txt)
+# ----------------------------------------------------------------------
+
+def _feed_comunas(**props_las_condes):
+    base = {
+        "COMUNA": "LAS_CONDES", "COD_VNR": 13114, "CENTRO": "CENTRO_ORIENTE",
+        "CLIENTESTOTAL": "154917", "CLIENTESAFECTADOS": "16", "PORCENTAJE": "   0.0", "TIPO": "COMUNA",
+    }
+    base.update(props_las_condes)
+    return {"features": [
+        {"properties": {"COMUNA": "CERRILLOS", "CLIENTESTOTAL": "33144", "CLIENTESAFECTADOS": "17", "PORCENTAJE": "   0.1"}},
+        {"properties": base},
+    ]}
+
+
+def test_extraer_estado_comuna_toma_solo_las_condes():
+    fila = mod.extraer_estado_comuna(_feed_comunas())
+    comuna, cod_vnr, centro, total, afectados, pct_enel, pct_calc = fila
+    assert comuna == "LAS_CONDES"
+    assert cod_vnr == 13114
+    assert centro == "CENTRO_ORIENTE"
+    assert total == 154917
+    assert afectados == 16
+    assert pct_enel == 0.0
+    assert pct_calc == pytest.approx(0.0103, abs=0.0001)  # Enel lo muestra redondeado como "0%"
+
+
+def test_extraer_estado_comuna_falla_si_la_comuna_no_viene():
+    with pytest.raises(RuntimeError):
+        mod.extraer_estado_comuna({"features": [{"properties": {"COMUNA": "CERRILLOS"}}]})
+
+
+def test_extraer_estado_comuna_porcentaje_no_numerico_queda_none():
+    fila = mod.extraer_estado_comuna(_feed_comunas(PORCENTAJE="n/d"))
+    assert fila[5] is None
+
+
+def test_insertar_comuna_estado_y_no_duplica_snapshot(conn):
+    fila = mod.extraer_estado_comuna(_feed_comunas())
+    mod.insertar_comuna_estado(conn, "2026-10-08 11:00:00", fila)
+    mod.insertar_comuna_estado(conn, "2026-10-08 11:00:00", fila)
+    conn.commit()
+    assert _fetchone(conn, "SELECT COUNT(*) FROM comuna_estado")[0] == 1
+    assert _fetchone(conn, "SELECT clientes_afectados, clientes_total FROM comuna_estado") == (16, 154917)
+
+
+def test_exportar_csv_comuna_estado(conn, tmp_path, monkeypatch):
+    path = tmp_path / "comuna_estado.csv"
+    monkeypatch.setattr(mod, "CSV_COMUNA_ESTADO_PATH", path)
+    mod.insertar_comuna_estado(conn, "2026-10-08 10:30:00", mod.extraer_estado_comuna(_feed_comunas(CLIENTESAFECTADOS="10")))
+    mod.insertar_comuna_estado(conn, "2026-10-08 11:00:00", mod.extraer_estado_comuna(_feed_comunas()))
+    conn.commit()
+
+    mod.exportar_csv_comuna_estado(conn)
+
+    filas = list(csv.DictReader(path.read_text(encoding="utf-8-sig").splitlines(), delimiter=";"))
+    assert [f["ClientesAfectados"] for f in filas] == ["16", "10"]  # mas reciente primero
+    assert filas[0]["Comuna"] == "LAS_CONDES"
+    assert filas[0]["ClientesTotal"] == "154917"
+
+
+def test_main_guarda_resumen_de_la_comuna(monkeypatch, tmp_path, punto_dentro):
+    lon, lat = punto_dentro
+    feed = {"features": [{
+        "geometry": {"coordinates": [lon, lat]},
+        "properties": {**_props(), "COD_EVENTO": "EVT-COMUNA", "numero_cliente": "1"},
+    }]}
+    _preparar_main(monkeypatch, tmp_path, feed)
+    monkeypatch.setattr(mod, "CSV_COMUNA_ESTADO_PATH", tmp_path / "comuna_estado.csv")
+    monkeypatch.setattr(mod, "descargar_comunas", lambda: _feed_comunas())
+
+    mod.main()
+
+    c = mod.conectar_db()
+    fila = _fetchone(c, "SELECT comuna, clientes_afectados, clientes_total FROM comuna_estado")
+    c.close()
+    assert fila == ("LAS_CONDES", 16, 154917)
+    assert (tmp_path / "comuna_estado.csv").exists()
+
+
+def test_main_si_falla_el_feed_de_comunas_igual_guarda_los_avisos(monkeypatch, tmp_path, punto_dentro):
+    lon, lat = punto_dentro
+    feed = {"features": [{
+        "geometry": {"coordinates": [lon, lat]},
+        "properties": {**_props(), "COD_EVENTO": "EVT-SIN-COMUNA", "numero_cliente": "1"},
+    }]}
+    _preparar_main(monkeypatch, tmp_path, feed)
+    monkeypatch.setattr(mod, "CSV_COMUNA_ESTADO_PATH", tmp_path / "comuna_estado.csv")
+
+    def _falla():
+        raise OSError("sin red")
+    monkeypatch.setattr(mod, "descargar_comunas", _falla)
+
+    mod.main()
+
+    c = mod.conectar_db()
+    n_eventos = _fetchone(c, "SELECT COUNT(*) FROM eventos WHERE cod_evento='EVT-SIN-COMUNA'")[0]
+    n_comuna = _fetchone(c, "SELECT COUNT(*) FROM comuna_estado")[0]
+    c.close()
+    assert n_eventos == 1
+    assert n_comuna == 0

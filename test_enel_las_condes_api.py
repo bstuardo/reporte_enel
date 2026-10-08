@@ -38,7 +38,7 @@ def _crear_db():
     with conn.cursor() as cur:
         cur.execute(
             "TRUNCATE eventos, historico_versiones, trafos_afectados, trafos_versiones, "
-            "descargos_programados, descargos_versiones, estado_sistema"
+            "descargos_programados, descargos_versiones, estado_sistema, comuna_estado, dim_h3, dim_unidad_vecinal"
         )
     conn.commit()
 
@@ -48,6 +48,7 @@ def _crear_db():
          "DESC_EVENTO": "prueba", "id_alim": "AL-1", "FECHA_INI": "22-07-2026 07:00",
          "FECHA_REPOSICION": "22-07-2026 12:00"},
         "88b2c5199", True, -70.58, -33.41, 3, "1,2,3", "900001,900002,900003", "ID-1,ID-2,ID-3",
+        "C-1",
     )
     historico.upsert_evento(
         conn, "2026-07-22 08:00:00", "EVT-2",
@@ -64,7 +65,7 @@ def _crear_db():
         conn, "2026-07-27 09:00:00", "NP-1",
         {"TIPO": "TRAFO", "TENSION": "MT", "INCIDENCIA": "DF-T1", "id_alim": "500",
          "FECHA_INICIO": "27-07-2026 08:00", "ESTADOINC": "Activo", "FECHA_REPOSICION": "27-07-2026 13:00"},
-        "88b2c5199", True, -70.58, -33.41, 12, "Los Alamos 123",
+        "88b2c5199", True, -70.58, -33.41, 12, "Los Alamos 123", "C-1",
     )
     conn.commit()
 
@@ -78,6 +79,9 @@ def _crear_db():
     conn.commit()
 
     historico.insertar_estado_sistema(conn, "2026-07-22 08:00:00", "22/07 08:00", 7)
+    historico.insertar_comuna_estado(
+        conn, "2026-07-22 08:00:00", ("LAS_CONDES", 13114, "CENTRO_ORIENTE", 154917, 16, 0.0, 0.0103),
+    )
     conn.commit()
     conn.close()
 
@@ -130,6 +134,7 @@ def test_eventos_activos_incluye_los_campos_agregados(client):
     assert fila["Tipo"] == "AVISO"
     assert fila["DescripcionEvento"] == "prueba"
     assert fila["EnMallaH3Referencia"] == 1
+    assert fila["UnidadVecinal"] == "C-1"
     assert fila["ClientesUnicos"] == "1,2,3"
     assert fila["CodigosAviso"] == "900001,900002,900003"
     assert fila["IdsAviso"] == "ID-1,ID-2,ID-3"
@@ -227,6 +232,7 @@ def test_trafos_activos_devuelve_los_datos_esperados(client):
     assert fila["Direcciones"] == "Los Alamos 123"
     assert fila["ClientesAfectados"] == 12
     assert fila["EstadoIncidencia"] == "Activo"
+    assert fila["UnidadVecinal"] == "C-1"
 
 
 def test_descargos_sin_filtro_devuelve_todos(client):
@@ -265,3 +271,31 @@ def test_estado_respeta_el_limite(client):
     resp = client.get("/estado", params={"limit": 1})
     assert resp.status_code == 200
     assert len(resp.json()) <= 1
+
+
+# ----------------------------------------------------------------------
+# Unidades vecinales (dimension, con geometria)
+# ----------------------------------------------------------------------
+
+def test_unidades_vecinales_devuelve_las_25(client):
+    conn = psycopg2.connect(**TEST_DB_CONFIG)
+    historico.poblar_dim_unidad_vecinal(conn)
+    conn.close()
+
+    resp = client.get("/unidades-vecinales")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 25
+    codigos = {fila["Codigo"] for fila in data}
+    assert codigos == {f"C-{n}" for n in range(1, 26)}
+    assert data[0]["GeometriaGeoJSON"] is not None
+
+
+def test_comuna_estado_devuelve_el_resumen_de_las_condes(client):
+    resp = client.get("/comuna/estado")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["Comuna"] == "LAS_CONDES"
+    assert data[0]["ClientesAfectados"] == 16
+    assert data[0]["ClientesTotal"] == 154917

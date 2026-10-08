@@ -28,6 +28,9 @@ Endpoints:
                                              ?activo=true|false para filtrar
     GET /estado                          -> historico del health-check de Enel (feed 4)
                                              ?limit=N (default 100)
+    GET /comuna/estado                   -> resumen de Las Condes segun Enel por corrida (feed 5)
+                                             ?limit=N (default 100)
+    GET /unidades-vecinales               -> las 25 unidades vecinales (dimension, con geometria)
 """
 
 import os
@@ -130,6 +133,7 @@ ACTIVOS_SQL = """
         id_alim AS "Alimentador",
         h3_index AS "H3Index",
         en_malla_h3_referencia AS "EnMallaH3Referencia",
+        unidad_vecinal AS "UnidadVecinal",
         lat AS "Latitud",
         lon AS "Longitud",
         avisos_unicos AS "ClientesUnicos",
@@ -156,6 +160,7 @@ HISTORICO_SQL_BASE = """
         id_alim AS "Alimentador",
         h3_index AS "H3Index",
         en_malla_h3_referencia AS "EnMallaH3Referencia",
+        unidad_vecinal AS "UnidadVecinal",
         lat AS "Latitud",
         lon AS "Longitud",
         avisos_unicos AS "ClientesUnicos",
@@ -176,6 +181,7 @@ VERSIONES_SQL = """
         falla AS "DetalleFalla",
         id_alim AS "Alimentador",
         h3_index AS "H3Index",
+        unidad_vecinal AS "UnidadVecinal",
         lat AS "Latitud",
         lon AS "Longitud",
         fecha_ini AS "FechaInicio",
@@ -195,6 +201,7 @@ TRAFOS_ACTIVOS_SQL = """
         id_alim AS "Alimentador",
         h3_index AS "H3Index",
         en_malla_h3_referencia AS "EnMallaH3Referencia",
+        unidad_vecinal AS "UnidadVecinal",
         lat AS "Latitud",
         lon AS "Longitud",
         clientes_afectados AS "ClientesAfectados",
@@ -219,6 +226,7 @@ DESCARGOS_SQL_BASE = """
         id_alim AS "Alimentador",
         h3_index AS "H3Index",
         en_malla_h3_referencia AS "EnMallaH3Referencia",
+        unidad_vecinal AS "UnidadVecinal",
         lat AS "Latitud",
         lon AS "Longitud",
         clientes_afectados AS "ClientesAfectados",
@@ -243,6 +251,32 @@ ESTADO_SQL = """
     LIMIT %s
 """
 
+COMUNA_ESTADO_SQL = """
+    SELECT
+        snapshot_ts AS "SnapshotTs",
+        comuna AS "Comuna",
+        cod_vnr AS "CodVnr",
+        centro AS "Centro",
+        clientes_total AS "ClientesTotal",
+        clientes_afectados AS "ClientesAfectados",
+        porcentaje_enel AS "PorcentajeEnel",
+        porcentaje_calculado AS "PorcentajeCalculado"
+    FROM comuna_estado
+    ORDER BY snapshot_ts DESC
+    LIMIT %s
+"""
+
+UNIDADES_VECINALES_SQL = """
+    SELECT
+        codigo AS "Codigo",
+        numero AS "Numero",
+        lat AS "Latitud",
+        lon AS "Longitud",
+        geometria_geojson AS "GeometriaGeoJSON"
+    FROM dim_unidad_vecinal
+    ORDER BY numero
+"""
+
 
 @app.get("/")
 def raiz():
@@ -257,6 +291,8 @@ def raiz():
             "/trafos/activos",
             "/descargos",
             "/estado",
+            "/unidades-vecinales",
+            "/comuna/estado",
         ],
     }
 
@@ -390,6 +426,31 @@ def estado_sistema(
     try:
         with conn.cursor() as cur:
             cur.execute(ESTADO_SQL, (limit,))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+@app.get("/comuna/estado")
+def comuna_estado(
+    limit: int = Query(100, ge=1, le=1000, description="Cantidad maxima de corridas a devolver"),
+    db_config: dict = Depends(get_db_config),
+) -> List[dict]:
+    conn = _conectar(db_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(COMUNA_ESTADO_SQL, (limit,))
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+@app.get("/unidades-vecinales")
+def unidades_vecinales(db_config: dict = Depends(get_db_config)) -> List[dict]:
+    conn = _conectar(db_config)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(UNIDADES_VECINALES_SQL)
             return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()

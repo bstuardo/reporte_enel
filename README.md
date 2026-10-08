@@ -2,8 +2,9 @@
 
 Pipeline que descarga el feed público de emergencias de Enel
 (`mapaemergencia.enel.com`), lo filtra al límite comunal oficial de Las
-Condes, lo enriquece con malla H3, y mantiene un repositorio histórico
-para alimentar Power BI, una API propia y Superset.
+Condes, lo enriquece con malla H3 y con las 25 unidades vecinales
+(barrios) de la comuna, y mantiene un repositorio histórico para
+alimentar Power BI, una API propia y Superset.
 
 ## Arquitectura
 
@@ -38,7 +39,7 @@ Credenciales de conexión via variables de entorno (ver
 `SUPABASE_DB_*` (réplica, opcional — si `SUPABASE_DB_HOST` queda vacío
 se omite sin afectar la corrida).
 
-## Los 4 feeds de Enel integrados
+## Los 5 feeds de Enel integrados
 
 | # | Endpoint | Contenido | Geometría | Tabla Postgres |
 |---|---|---|---|---|
@@ -46,6 +47,7 @@ se omite sin afectar la corrida).
 | 2 | `me-capa-trafosAfectados.txt` | Transformadores afectados. **El feed mezcla dos tipos**: `TIPO=TRAFO` (incidentes reales) y `TIPO=DESCARGO` (cortes programados) — solo se usa la parte `TRAFO` de este feed | Polygon | `trafos_afectados` + `trafos_versiones` |
 | 3 | `me-capa-descargos.txt` | Cortes programados/mantenimiento (feed dedicado, mismo esquema que las filas `TIPO=DESCARGO` de trafosAfectados) | Polygon | `descargos_programados` + `descargos_versiones` |
 | 4 | `me-capa-estado.txt` | Health-check general del sistema Enel (`{errorCode, msg, datos, porcentaje}`) | N/A | `estado_sistema` |
+| 5 | `me-capa-comunasAfectadas.txt` | Resumen por comuna de toda la concesión (una feature por comuna). Es el origen del texto que muestra el mapa de Enel, p. ej. `LAS_CONDES: 16 clientes afectados (0%)`. Solo se guarda la fila de Las Condes | Polygon (no se usa) | `comuna_estado` |
 
 **Cruce (RF-05):** los feeds 2 y 3 traen `INCIDENCIA`, que coincide en
 formato con `COD_EVENTO`/`CODIGO` del feed 1 (ej. `DF202671756176`). El
@@ -69,17 +71,22 @@ que corresponda).
 
 ### Otras capas del mapa de Enel (detectadas, sin integrar)
 
-Revisando el código fuente de `mapaemergencia.enel.com` (`js/featuresVisibilityObject.js`)
-aparecen banderas de visibilidad para capas adicionales a las 4
-integradas: `comuna` (límite comunal propio de Enel, dibujado como
-referencia visual — nosotros usamos nuestro propio límite oficial
-municipal), `electro`, `libres`, `alim` (alimentadores), `cuadrillas`
+Revisando el código fuente de `mapaemergencia.enel.com` (`js/featuresVisibilityObject.js`
+y `mapa.js`) aparecen banderas de visibilidad para capas adicionales a
+las integradas. La capa `comuna` resultó ser el feed 5
+(`me-capa-comunasAfectadas.txt`, ya integrado: trae `CLIENTESTOTAL`,
+`CLIENTESAFECTADOS` y `PORCENTAJE` por comuna, además del polígono —
+seguimos usando nuestro propio límite oficial municipal para filtrar).
+Siguen sin integrar: `electro`, `libres`, `alim` (alimentadores), `cuadrillas`
 (equipos en terreno), `smt`/`smtTns` y `clinica`. También existe una
 empresa "Colina" (`empresa=C`) con su propio set paralelo de capas
 (avisos/descargos/comuna/alimentador), que corresponde a una zona/
 distribuidora distinta a Las Condes.
 
-**Ninguna de estas tiene un endpoint público confirmado** — se probaron
+**Ninguna de estas tiene un endpoint público confirmado** (`mapa.js`
+nombra `me-capa-alimAfectados.txt`, `me-capa-electro.txt`,
+`me-capa-libres.txt` y `me-capa-smt.txt`, pero en la ruta
+`galeria/documento` devuelven 404) — se probaron
 variantes de nombre razonables (`me-capa-electro.txt`, `me-capa-libres.txt`,
 `me-capa-comunas.txt`, `me-capa-alimentadores.txt`, `me-capa-smt.txt`,
 `me-capa-cuadrillas.txt`, `me-capa-clinica.txt`, etc.) y todas devuelven
@@ -109,6 +116,7 @@ cada corrida (no se anexan filas).
 | Alimentador | `id_alim` | Alimentador eléctrico |
 | H3Index | calculado | Hexágono H3 resolución 8 del punto |
 | EnMallaH3Referencia | calculado | 1 si el hexágono está en `H3_LasCondes_Res8.geojson` |
+| UnidadVecinal | calculado | Código de la unidad vecinal (`C-1`..`C-25`) que contiene el punto, según `Unidades_Vecinales_LasCondes.geojson`; `null` si no cae dentro de ninguna |
 | Latitud / Longitud | geometría | Coordenadas del punto |
 | ClientesUnicos | calculado | Lista de `numero_cliente` distintos, separados por coma |
 | CodigosAviso | calculado | Lista de `COD_AVISO` distintos del evento |
@@ -136,6 +144,7 @@ Mismas columnas que el anterior, más:
 | Tension | `TENSION` | Nivel de tensión (ej. `MT`) |
 | Alimentador | `id_alim` | Alimentador eléctrico |
 | H3Index / EnMallaH3Referencia | calculado | Igual que en avisos, sobre el `representative_point()` del polígono |
+| UnidadVecinal | calculado | Igual que en avisos, sobre el `representative_point()` del polígono |
 | Latitud / Longitud | geometría | Coordenadas del `representative_point()` |
 | ClientesAfectados | `CLITOTAL` o fallback | Oficial de Enel si viene informado; si no, clientes distintos cruzados desde avisos |
 | Direcciones | cruce RF-05 | Direcciones de los avisos con la misma `INCIDENCIA`, separadas por coma |
@@ -143,6 +152,16 @@ Mismas columnas que el anterior, más:
 | FechaInicio | `FECHA_INICIO` | |
 | FechaReposicionEstimada | `FECHA_REPOSICION` | Se actualiza cada corrida |
 | PrimeraVezVisto / UltimaVezVisto | snapshot | Igual que en avisos |
+
+### `enel_las_condes_trafos_historico.csv` (feed 2, todos)
+
+Mismas columnas que el anterior, más:
+
+| Columna | Descripción |
+|---|---|
+| Activo | 1 = activo, 0 = resuelto |
+| FechaResolucionDetectada | Snapshot en que se detectó que el `numpos` dejó de aparecer en el feed |
+| HorasActivo | Para resueltos, se congela en `FechaResolucionDetectada` (no sigue creciendo) |
 
 ### `enel_las_condes_descargos.csv` (feed 3, **todos**, no solo activos)
 
@@ -152,7 +171,7 @@ Mismas columnas que el anterior, más:
 | Incidencia | `INCIDENCIA` | Cruza con `CodigoEvento` del feed de avisos |
 | DescargoCodigo | `DESCARGO` | Código propio del descargo (ej. `DF...( TP...)`) |
 | Tipo / Tension / Alimentador | igual que trafos | |
-| H3Index / EnMallaH3Referencia / Latitud / Longitud | calculado | |
+| H3Index / EnMallaH3Referencia / UnidadVecinal / Latitud / Longitud | calculado | |
 | ClientesAfectados | `CLITOTAL` o fallback | |
 | Direcciones | cruce RF-05 | |
 | EstadoDescargo | `ESTADODESC` | |
@@ -162,30 +181,63 @@ Mismas columnas que el anterior, más:
 | Activo | calculado | 1 mientras el `numpos` siga apareciendo en el feed |
 | EstadoTemporal | calculado (RF-07) | `futuro` / `en_curso` / `finalizado`, comparando la ventana horaria contra el momento del reporte |
 
+### `enel_las_condes_comuna_estado.csv` (feed 5, una fila por corrida)
+
+Historial del resumen de Las Condes según Enel, más reciente primero.
+
+| Columna | Origen | Descripción |
+|---|---|---|
+| SnapshotTs | snapshot | Timestamp de nuestra corrida (`YYYY-MM-DD HH:MM:SS`) |
+| Comuna / CodVnr / Centro | `COMUNA` / `COD_VNR` / `CENTRO` | Identificación de la comuna en Enel (`LAS_CONDES`, `13114`, `CENTRO_ORIENTE`) |
+| ClientesTotal | `CLIENTESTOTAL` | Clientes totales de la comuna |
+| ClientesAfectados | `CLIENTESAFECTADOS` | Clientes afectados según Enel (el número del mapa) |
+| PorcentajeEnel | `PORCENTAJE` | Porcentaje tal como lo informa Enel (1 decimal, por eso suele verse `0`) |
+| PorcentajeCalculado | calculado | `ClientesAfectados / ClientesTotal * 100` con 4 decimales |
+
+Este número es el oficial de Enel para la comuna y **no necesariamente
+coincide** con la suma de `ClientesAfectados` de nuestros avisos/trafos
+(son fuentes distintas).
+
+### `enel_las_condes_descargos_activos.csv` (feed 3, solo activos)
+
+Mismas columnas que `enel_las_condes_descargos.csv`, salvo `Activo` (se
+omite, ya que siempre sería 1 al estar filtrado).
+
 ## Modelo relacional para visualización (Fase 4)
 
-Los 3 feeds geográficos (avisos, trafos, descargos) comparten dos claves
-naturales — `INCIDENCIA`/`COD_EVENTO` y `h3_index` — pero viven en tablas
-separadas. `crear_vistas()` y `poblar_dim_h3()` (llamadas cada corrida,
-en Postgres local y en la réplica de Supabase) arman el modelo relacional
-sobre esas claves, para que Power BI o Superset lo consuman directo sin
-reimplementar los joins:
+Los 3 feeds geográficos (avisos, trafos, descargos) comparten tres claves
+naturales — `INCIDENCIA`/`COD_EVENTO`, `h3_index` y `unidad_vecinal` —
+pero viven en tablas separadas. `crear_vistas()`, `poblar_dim_h3()` y
+`poblar_dim_unidad_vecinal()` (llamadas cada corrida, en Postgres local y
+en la réplica de Supabase) arman el modelo relacional sobre esas claves,
+para que Power BI o Superset lo consuman directo sin reimplementar los
+joins:
 
 | Objeto | Tipo | Contenido |
 |---|---|---|
 | `dim_h3` | Tabla (dimensión) | Un registro por hexágono H3 usado en cualquiera de los 3 feeds o en la malla de referencia, con su centroide (`lat`/`lon` via `h3.cell_to_latlng`) y si pertenece a la malla oficial |
+| `dim_unidad_vecinal` | Tabla (dimensión) | Un registro por cada una de las 25 unidades vecinales (`codigo` `C-1`..`C-25`, `numero`), con un punto de referencia garantizado dentro del polígono (`representative_point()`) y su geometría completa como GeoJSON (`geometria_geojson`), para mapear por polígono |
 | `vw_trafos_con_aviso` | Vista | `trafos_afectados` + los campos del aviso de origen (`falla`, `desc_evento`, `fecha_ini`) cruzados por `INCIDENCIA = cod_evento` |
 | `vw_descargos_con_aviso` | Vista | Mismo cruce, para `descargos_programados` |
-| `vw_cortes_unificado` | Vista (UNION ALL) | Los 3 feeds normalizados a un solo "hecho": `tipo_fuente` (`AVISO`/`TRAFO`/`DESCARGO`), `identificador`, `incidencia`, `h3_index`, `lat`/`lon`, `clientes_afectados`, `direcciones`, `fecha_inicio`, `activo` — la fuente para mapas y series de tiempo cruzados entre feeds |
+| `vw_cortes_unificado` | Vista (UNION ALL) | Los 3 feeds normalizados a un solo "hecho": `tipo_fuente` (`AVISO`/`TRAFO`/`DESCARGO`), `identificador`, `incidencia`, `h3_index`, `lat`/`lon`, `clientes_afectados`, `direcciones`, `fecha_inicio`, `activo`, `unidad_vecinal` — la fuente para mapas y series de tiempo cruzados entre feeds |
 | `vw_duracion_cortes` | Vista | Horas de duración (`fecha_ini` → `fecha_resolucion_detectada`) de cada aviso ya resuelto, por `alimentador` — base del ranking de duración |
 | `vw_mapa_h3` | Vista | `vw_cortes_unificado` (solo activos) agregado por `h3_index` vía `dim_h3`: total de clientes afectados y conteo por tipo de fuente, por hexágono — un registro por hexágono, listo para mapear |
+| `vw_mapa_unidad_vecinal` | Vista | `vw_cortes_unificado` (solo activos) agregado por `unidad_vecinal` vía `dim_unidad_vecinal`: total de clientes afectados y conteo por tipo de fuente, por barrio — un registro por unidad vecinal, listo para mapear |
+
+**Unidades vecinales (barrio):** `Unidades_Vecinales_LasCondes.geojson`
+trae los 25 polígonos oficiales (exportados desde KML; el código `C-<n>`
+viene embebido como texto en `properties.descriptio`).
+`cargar_unidades_vecinales()` los parsea una vez por corrida y
+`unidad_vecinal_de_punto()` clasifica cada punto (mismo criterio
+inclusivo `covers()` que el filtro comunal) — igual patrón que la malla
+H3, pero pensado para reportar/filtrar por barrio en vez de por hexágono.
 
 **Mapa geográfico:** este Superset (Docker) sí trae los plugins de
 mapas (deck.gl + MapLibre/Carto, sin necesitar token de Mapbox — el
-renderer por defecto usa mosaicos abiertos de Carto/OpenStreetMap). El
-chart de mapa usa el tipo **deck.gl Scatterplot** sobre `vw_mapa_h3`:
-un punto por hexágono, en su centroide real, con tamaño proporcional a
-`clientes_afectados_total`.
+renderer por defecto usa mosaicos abiertos de Carto/OpenStreetMap). Los
+charts de mapa usan el tipo **deck.gl Scatterplot** sobre `vw_mapa_h3` y
+`vw_mapa_unidad_vecinal`: un punto por hexágono/barrio, con tamaño
+proporcional a `clientes_afectados_total`.
 
 ### Dashboard en Superset
 
@@ -193,10 +245,12 @@ un punto por hexágono, en su centroide real, con tamaño proporcional a
 - **Serie de tiempo — clientes afectados**: `vw_cortes_unificado`, `SUM(clientes_afectados)` por día, desglosado por `tipo_fuente`.
 - **Ranking de duración de cortes por alimentador**: `vw_duracion_cortes`, promedio de `horas_duracion` por `alimentador`, descendente.
 - **Mapa por H3Index — clientes afectados por hexágono**: `vw_mapa_h3`, deck.gl Scatterplot sobre el centroide de cada hexágono, tamaño = clientes afectados.
+- **Mapa por Unidad Vecinal — clientes afectados**: `vw_mapa_unidad_vecinal`, deck.gl Scatterplot sobre el punto de referencia de cada barrio, tamaño = clientes afectados.
 
 Datasets registrados en Superset (conexión "Postgres Local - Enel Las
 Condes"): `vw_cortes_unificado`, `vw_trafos_con_aviso`,
-`vw_descargos_con_aviso`, `vw_duracion_cortes`, `vw_mapa_h3`, `dim_h3`.
+`vw_descargos_con_aviso`, `vw_duracion_cortes`, `vw_mapa_h3`, `dim_h3`,
+`vw_mapa_unidad_vecinal`, `dim_unidad_vecinal`.
 
 ## API (FastAPI)
 
@@ -204,7 +258,8 @@ Condes"): `vw_cortes_unificado`, `vw_trafos_con_aviso`,
 `/docs` para la documentación interactiva. Mismos campos que los CSV
 correspondientes, vía `/eventos/activos`, `/eventos/historico`,
 `/eventos/{cod_evento}/versiones`, `/trafos/activos`, `/descargos`,
-`/estado`, `/health`.
+`/estado`, `/comuna/estado`, `/health`, `/unidades-vecinales` (dimensión de las 25
+unidades vecinales, con su geometría).
 
 ## Mantenimiento del histórico (Fase 3)
 

@@ -2,13 +2,16 @@
 Historico de Avisos Enel - Las Condes (v5)
 CMU - Municipalidad de Las Condes
 
-Descarga los 4 feeds publicos de Enel (mapaemergencia.enel.com):
+Descarga los 5 feeds publicos de Enel (mapaemergencia.enel.com):
     1) me-capa-avisos.txt            -> avisos individuales de clientes (Point)
     2) me-capa-trafosAfectados.txt   -> transformadores afectados, TIPO=TRAFO
                                          (mezclado con TIPO=DESCARGO en el mismo
                                          feed; solo se usa la parte TRAFO aqui)
     3) me-capa-descargos.txt         -> cortes programados/mantenimiento (Polygon)
     4) me-capa-estado.txt            -> health-check general (JSON simple)
+    5) me-capa-comunasAfectadas.txt  -> resumen por comuna (el texto "LAS_CONDES:
+                                         N clientes afectados (X%)" del mapa de Enel);
+                                         solo se guarda la fila de Las Condes
 
 FILTRO:  limite comunal OFICIAL de Las Condes (Limite_Comunal_LasCondes.geojson,
          EPSG:4326), point-in-polygon INCLUSIVO: pasan los puntos que caen
@@ -18,7 +21,9 @@ FILTRO:  limite comunal OFICIAL de Las Condes (Limite_Comunal_LasCondes.geojson,
          dentro de la forma.
 VISUAL:  cada registro que pasa el filtro se etiqueta ademas con su
          h3_index (malla H3_LasCondes_Res8.geojson, resolucion 8) para
-         mapearlo/agregarlo en Power BI por hexagono.
+         mapearlo/agregarlo en Power BI por hexagono, y con su
+         unidad_vecinal (Unidades_Vecinales_LasCondes.geojson, codigo
+         "C-1".."C-25") para agregarlo por barrio/unidad vecinal.
 CRUCE:   los feeds 2 y 3 comparten INCIDENCIA con COD_EVENTO/CODIGO del feed 1;
          se usa para enriquecerlos con direccion(es) y clientes afectados.
 
@@ -44,19 +49,26 @@ Archivos esperados en la misma carpeta que este script:
                                         con campo "nom_com" = "LAS CONDES")
     H3_LasCondes_Res8.geojson          (malla H3 res. 8, solo
                                          para visualizacion)
+    Unidades_Vecinales_LasCondes.geojson (25 poligonos de unidades
+                                        vecinales, EPSG:4326, solo
+                                        para visualizacion)
 
 Salidas (en la misma carpeta):
-    enel_las_condes_eventos_activos.csv   -> avisos activos, para Power BI
-    enel_las_condes_eventos_historico.csv -> avisos, historico completo
-    enel_las_condes_trafos_activos.csv    -> transformadores afectados activos
-    enel_las_condes_descargos.csv         -> descargos programados (todos)
-    enel_las_condes_log.txt               -> log de ejecucion
+    enel_las_condes_eventos_activos.csv    -> avisos activos, para Power BI
+    enel_las_condes_eventos_historico.csv  -> avisos, historico completo
+    enel_las_condes_trafos_activos.csv     -> transformadores afectados activos
+    enel_las_condes_trafos_historico.csv   -> transformadores afectados, historico completo
+    enel_las_condes_descargos.csv          -> descargos programados (todos)
+    enel_las_condes_descargos_activos.csv  -> descargos programados activos
+    enel_las_condes_comuna_estado.csv      -> resumen de Las Condes por corrida (feed 5)
+    enel_las_condes_log.txt                -> log de ejecucion
 """
 
 import csv
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -75,10 +87,14 @@ from shapely.geometry import Point, shape
 BASE_DIR = Path(__file__).resolve().parent
 LIMITE_COMUNAL_PATH = BASE_DIR / "Limite_Comunal_LasCondes.geojson"
 H3_GEOJSON_PATH = BASE_DIR / "H3_LasCondes_Res8.geojson"
+UNIDADES_VECINALES_PATH = BASE_DIR / "Unidades_Vecinales_LasCondes.geojson"
 CSV_ACTIVOS_PATH = BASE_DIR / "enel_las_condes_eventos_activos.csv"
 CSV_HISTORICO_PATH = BASE_DIR / "enel_las_condes_eventos_historico.csv"
 CSV_TRAFOS_ACTIVOS_PATH = BASE_DIR / "enel_las_condes_trafos_activos.csv"
+CSV_TRAFOS_HISTORICO_PATH = BASE_DIR / "enel_las_condes_trafos_historico.csv"
 CSV_DESCARGOS_PATH = BASE_DIR / "enel_las_condes_descargos.csv"
+CSV_DESCARGOS_ACTIVOS_PATH = BASE_DIR / "enel_las_condes_descargos_activos.csv"
+CSV_COMUNA_ESTADO_PATH = BASE_DIR / "enel_las_condes_comuna_estado.csv"
 LOG_PATH = BASE_DIR / "enel_las_condes_log.txt"
 
 ONEDRIVE_DIR = Path(
@@ -105,6 +121,7 @@ URL_TEMPLATE = "https://mapaemergencia.enel.com/galeria/documento/me-capa-avisos
 URL_TRAFOS_TEMPLATE = "https://mapaemergencia.enel.com/galeria/documento/me-capa-trafosAfectados.txt?&={ts}"
 URL_DESCARGOS_TEMPLATE = "https://mapaemergencia.enel.com/galeria/documento/me-capa-descargos.txt?&={ts}"
 URL_ESTADO_TEMPLATE = "https://mapaemergencia.enel.com/galeria/documento/me-capa-estado.txt?&={ts}"
+URL_COMUNAS_TEMPLATE = "https://mapaemergencia.enel.com/galeria/documento/me-capa-comunasAfectadas.txt?&={ts}"
 H3_RESOLUCION = 8  # debe coincidir con la resolucion de H3_LasCondes_Res8.geojson
 
 NOMBRE_COMUNA_FILTRO = "Las Condes"
@@ -185,6 +202,48 @@ def h3_de_punto(lat: float, lon: float) -> str:
 
 
 # ----------------------------------------------------------------------
+# UNIDADES VECINALES (SOLO VISUALIZACION)
+# ----------------------------------------------------------------------
+
+def cargar_unidades_vecinales() -> list:
+    """Lee Unidades_Vecinales_LasCondes.geojson (EPSG:4326, exportado desde
+    KML: cada feature trae el codigo "C-<n>" embebido como texto en
+    properties.descriptio, ej. "... VECINAL   C-4 ..."). Devuelve una lista
+    de (codigo, numero, poligono) para clasificar puntos por barrio."""
+    with open(UNIDADES_VECINALES_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    unidades = []
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        match = re.search(r"VECINAL\s+(\S+)", props.get("descriptio", ""))
+        codigo = match.group(1) if match else f"C-{props.get('Name')}"
+        try:
+            numero = int(props.get("Name"))
+        except (TypeError, ValueError):
+            numero = None
+        try:
+            poligono = shape(feat["geometry"])
+        except Exception:
+            continue
+        unidades.append((codigo, numero, poligono))
+
+    logging.info("Unidades vecinales cargadas: %d poligonos", len(unidades))
+    return unidades
+
+
+def unidad_vecinal_de_punto(lat: float, lon: float, unidades_vecinales: list) -> str:
+    """Codigo de la unidad vecinal ("C-1".."C-25") que contiene el punto, o
+    None si no cae dentro de ninguna (mismo criterio inclusivo -covers()-
+    que el filtro comunal). Busqueda lineal: solo son 25 poligonos."""
+    punto = Point(lon, lat)
+    for codigo, _, poligono in unidades_vecinales:
+        if poligono.covers(punto):
+            return codigo
+    return None
+
+
+# ----------------------------------------------------------------------
 # DESCARGA
 # ----------------------------------------------------------------------
 
@@ -210,6 +269,42 @@ def descargar_descargos() -> dict:
 
 def descargar_estado() -> dict:
     return _descargar_json(URL_ESTADO_TEMPLATE)
+
+
+def descargar_comunas() -> dict:
+    return _descargar_json(URL_COMUNAS_TEMPLATE)
+
+
+def _normalizar_comuna(nombre) -> str:
+    return str(nombre or "").replace("_", " ").strip().lower()
+
+
+def extraer_estado_comuna(data: dict) -> tuple:
+    """Del feed me-capa-comunasAfectadas.txt (una feature Polygon por comuna
+    de toda la concesion de Enel) toma solo la de NOMBRE_COMUNA_FILTRO y
+    devuelve (comuna, cod_vnr, centro, clientes_total, clientes_afectados,
+    porcentaje_enel, porcentaje_calculado). Es lo que el mapa de Enel muestra
+    como "LAS_CONDES: 16 clientes afectados (0%)". `porcentaje_enel` es el
+    redondeado a 1 decimal que informa Enel; `porcentaje_calculado` se
+    recalcula con mas precision (afectados / total). Lanza RuntimeError si
+    la comuna no viene en el feed."""
+    objetivo = _normalizar_comuna(NOMBRE_COMUNA_FILTRO)
+    for feat in data.get("features", []):
+        props = feat.get("properties", {})
+        if _normalizar_comuna(props.get("COMUNA")) != objetivo:
+            continue
+        total = int(str(props.get("CLIENTESTOTAL", "")).strip() or 0)
+        afectados = int(str(props.get("CLIENTESAFECTADOS", "")).strip() or 0)
+        try:
+            porcentaje_enel = float(str(props.get("PORCENTAJE", "")).strip())
+        except ValueError:
+            porcentaje_enel = None
+        porcentaje_calculado = round(afectados / total * 100, 4) if total else None
+        return (
+            props.get("COMUNA"), props.get("COD_VNR"), props.get("CENTRO"),
+            total, afectados, porcentaje_enel, porcentaje_calculado,
+        )
+    raise RuntimeError(f"El feed de comunas no trae la comuna '{NOMBRE_COMUNA_FILTRO}'")
 
 
 # ----------------------------------------------------------------------
@@ -271,7 +366,7 @@ def _clientes_afectados_poligono(props, clientes_fallback):
     return len(clientes_fallback)
 
 
-def _preparar_filas_polygon(seleccionados, avisos_por_incidencia):
+def _preparar_filas_polygon(seleccionados, avisos_por_incidencia, unidades_vecinales=()):
     """Igual proposito que _preparar_filas, para trafosAfectados/descargos:
     calcula una sola vez las direcciones/clientes cruzados via INCIDENCIA."""
     filas = []
@@ -284,7 +379,8 @@ def _preparar_filas_polygon(seleccionados, avisos_por_incidencia):
         info = avisos_por_incidencia.get(incidencia, {"direcciones": set(), "clientes": set()})
         direcciones = ",".join(sorted(info["direcciones"]))
         clientes_afectados = _clientes_afectados_poligono(props, info["clientes"])
-        filas.append((numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones))
+        unidad_vecinal = unidad_vecinal_de_punto(lat, lon, unidades_vecinales)
+        filas.append((numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones, unidad_vecinal))
     return filas
 
 
@@ -319,6 +415,7 @@ def init_db(conn):
                 id_alim TEXT,
                 h3_index TEXT,
                 en_malla_h3_referencia INTEGER,
+                unidad_vecinal TEXT,
                 lon DOUBLE PRECISION,
                 lat DOUBLE PRECISION,
                 fecha_ini TEXT,
@@ -340,6 +437,7 @@ def init_db(conn):
                 falla TEXT,
                 id_alim TEXT,
                 h3_index TEXT,
+                unidad_vecinal TEXT,
                 lon DOUBLE PRECISION,
                 lat DOUBLE PRECISION,
                 fecha_ini TEXT,
@@ -359,6 +457,7 @@ def init_db(conn):
                 id_alim TEXT,
                 h3_index TEXT,
                 en_malla_h3_referencia INTEGER,
+                unidad_vecinal TEXT,
                 lon DOUBLE PRECISION,
                 lat DOUBLE PRECISION,
                 fecha_inicio TEXT,
@@ -381,6 +480,7 @@ def init_db(conn):
                 clientes_afectados INTEGER,
                 direcciones TEXT,
                 h3_index TEXT,
+                unidad_vecinal TEXT,
                 lon DOUBLE PRECISION,
                 lat DOUBLE PRECISION
             );
@@ -397,6 +497,7 @@ def init_db(conn):
                 id_alim TEXT,
                 h3_index TEXT,
                 en_malla_h3_referencia INTEGER,
+                unidad_vecinal TEXT,
                 lon DOUBLE PRECISION,
                 lat DOUBLE PRECISION,
                 descargo_codigo TEXT,
@@ -422,6 +523,7 @@ def init_db(conn):
                 clientes_afectados INTEGER,
                 direcciones TEXT,
                 h3_index TEXT,
+                unidad_vecinal TEXT,
                 lon DOUBLE PRECISION,
                 lat DOUBLE PRECISION
             );
@@ -436,6 +538,18 @@ def init_db(conn):
                 porcentaje INTEGER
             );
 
+            -- Feed 5: resumen de la comuna segun Enel (una fila por corrida)
+            CREATE TABLE IF NOT EXISTS comuna_estado (
+                snapshot_ts TEXT PRIMARY KEY,
+                comuna TEXT,
+                cod_vnr INTEGER,
+                centro TEXT,
+                clientes_total INTEGER,
+                clientes_afectados INTEGER,
+                porcentaje_enel DOUBLE PRECISION,
+                porcentaje_calculado DOUBLE PRECISION
+            );
+
             -- Dimension H3 (Fase 4 - modelo relacional para visualizacion):
             -- un registro por hexagono, compartido por los 3 feeds
             CREATE TABLE IF NOT EXISTS dim_h3 (
@@ -444,6 +558,18 @@ def init_db(conn):
                 lon DOUBLE PRECISION,
                 en_malla_referencia BOOLEAN
             );
+
+            -- Dimension Unidad Vecinal (modelo relacional para visualizacion):
+            -- un registro por cada uno de los 25 barrios/unidades vecinales,
+            -- con su geometria (para mapas de poligonos) y un punto de
+            -- referencia dentro de ella, compartido por los 3 feeds
+            CREATE TABLE IF NOT EXISTS dim_unidad_vecinal (
+                codigo TEXT PRIMARY KEY,
+                numero INTEGER,
+                lat DOUBLE PRECISION,
+                lon DOUBLE PRECISION,
+                geometria_geojson TEXT
+            );
             """
         )
         # Defensivo: si la tabla ya existia de una version anterior del
@@ -451,20 +577,41 @@ def init_db(conn):
         cur.execute("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS tipo TEXT")
         cur.execute("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS cod_avisos TEXT")
         cur.execute("ALTER TABLE eventos ADD COLUMN IF NOT EXISTS ids_aviso TEXT")
+        for tabla in (
+            "eventos", "historico_versiones",
+            "trafos_afectados", "trafos_versiones",
+            "descargos_programados", "descargos_versiones",
+        ):
+            cur.execute(f"ALTER TABLE {tabla} ADD COLUMN IF NOT EXISTS unidad_vecinal TEXT")
     conn.commit()
 
 
+def insertar_comuna_estado(conn, snapshot_ts, fila):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO comuna_estado (
+                snapshot_ts, comuna, cod_vnr, centro, clientes_total,
+                clientes_afectados, porcentaje_enel, porcentaje_calculado
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (snapshot_ts) DO NOTHING
+            """,
+            (snapshot_ts, *fila),
+        )
+
+
 def upsert_evento(conn, snapshot_ts, cod_evento, props, h3_index, en_malla_ref,
-                   lon, lat, clientes_afectados, avisos_unicos, cod_avisos, ids_aviso):
+                   lon, lat, clientes_afectados, avisos_unicos, cod_avisos, ids_aviso,
+                   unidad_vecinal=None):
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO eventos (
                 cod_evento, codigo, tipo, direccion, falla, desc_evento, id_alim,
-                h3_index, en_malla_h3_referencia, lon, lat, fecha_ini,
+                h3_index, en_malla_h3_referencia, unidad_vecinal, lon, lat, fecha_ini,
                 fecha_reposicion_estimada, primera_vez_visto, ultima_vez_visto,
                 clientes_afectados, avisos_unicos, cod_avisos, ids_aviso, activo
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
             ON CONFLICT (cod_evento) DO UPDATE SET
                 falla = EXCLUDED.falla,
                 fecha_reposicion_estimada = EXCLUDED.fecha_reposicion_estimada,
@@ -473,13 +620,14 @@ def upsert_evento(conn, snapshot_ts, cod_evento, props, h3_index, en_malla_ref,
                 avisos_unicos = EXCLUDED.avisos_unicos,
                 cod_avisos = EXCLUDED.cod_avisos,
                 ids_aviso = EXCLUDED.ids_aviso,
+                unidad_vecinal = EXCLUDED.unidad_vecinal,
                 activo = 1,
                 fecha_resolucion_detectada = NULL
             """,
             (
                 cod_evento, props.get("CODIGO"), props.get("TIPO"), props.get("DIRECCION"),
                 props.get("FALLA"), props.get("DESC_EVENTO"), props.get("id_alim"),
-                h3_index, int(en_malla_ref), lon, lat, props.get("FECHA_INI"),
+                h3_index, int(en_malla_ref), unidad_vecinal, lon, lat, props.get("FECHA_INI"),
                 props.get("FECHA_REPOSICION"), snapshot_ts, snapshot_ts,
                 clientes_afectados, avisos_unicos, cod_avisos, ids_aviso,
             ),
@@ -488,12 +636,12 @@ def upsert_evento(conn, snapshot_ts, cod_evento, props, h3_index, en_malla_ref,
             """
             INSERT INTO historico_versiones (
                 snapshot_ts, cod_evento, direccion, falla, id_alim, h3_index,
-                lon, lat, fecha_ini, fecha_reposicion_estimada, clientes_afectados
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                unidad_vecinal, lon, lat, fecha_ini, fecha_reposicion_estimada, clientes_afectados
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 snapshot_ts, cod_evento, props.get("DIRECCION"), props.get("FALLA"),
-                props.get("id_alim"), h3_index, lon, lat, props.get("FECHA_INI"),
+                props.get("id_alim"), h3_index, unidad_vecinal, lon, lat, props.get("FECHA_INI"),
                 props.get("FECHA_REPOSICION"), clientes_afectados,
             ),
         )
@@ -524,28 +672,29 @@ def marcar_resueltos(conn, cod_eventos_vistos_hoy, snapshot_ts):
 
 
 def upsert_trafo(conn, snapshot_ts, numpos, props, h3_index, en_malla_ref, lon, lat,
-                  clientes_afectados, direcciones):
+                  clientes_afectados, direcciones, unidad_vecinal=None):
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO trafos_afectados (
                 numpos, incidencia, tipo, tension, id_alim, h3_index,
-                en_malla_h3_referencia, lon, lat, fecha_inicio,
+                en_malla_h3_referencia, unidad_vecinal, lon, lat, fecha_inicio,
                 estadoinc, fecha_reposicion, direcciones, clientes_afectados,
                 primera_vez_visto, ultima_vez_visto, activo
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
             ON CONFLICT (numpos) DO UPDATE SET
                 estadoinc = EXCLUDED.estadoinc,
                 fecha_reposicion = EXCLUDED.fecha_reposicion,
                 direcciones = EXCLUDED.direcciones,
                 clientes_afectados = EXCLUDED.clientes_afectados,
                 ultima_vez_visto = EXCLUDED.ultima_vez_visto,
+                unidad_vecinal = EXCLUDED.unidad_vecinal,
                 activo = 1,
                 fecha_resolucion_detectada = NULL
             """,
             (
                 numpos, props.get("INCIDENCIA"), props.get("TIPO"), props.get("TENSION"),
-                props.get("id_alim"), h3_index, int(en_malla_ref), lon, lat,
+                props.get("id_alim"), h3_index, int(en_malla_ref), unidad_vecinal, lon, lat,
                 props.get("FECHA_INICIO"), props.get("ESTADOINC"), props.get("FECHA_REPOSICION"),
                 direcciones, clientes_afectados, snapshot_ts, snapshot_ts,
             ),
@@ -554,40 +703,42 @@ def upsert_trafo(conn, snapshot_ts, numpos, props, h3_index, en_malla_ref, lon, 
             """
             INSERT INTO trafos_versiones (
                 snapshot_ts, numpos, incidencia, estadoinc, fecha_reposicion,
-                clientes_afectados, direcciones, h3_index, lon, lat
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                clientes_afectados, direcciones, h3_index, unidad_vecinal, lon, lat
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 snapshot_ts, numpos, props.get("INCIDENCIA"), props.get("ESTADOINC"),
-                props.get("FECHA_REPOSICION"), clientes_afectados, direcciones, h3_index, lon, lat,
+                props.get("FECHA_REPOSICION"), clientes_afectados, direcciones, h3_index,
+                unidad_vecinal, lon, lat,
             ),
         )
 
 
 def upsert_descargo(conn, snapshot_ts, numpos, props, h3_index, en_malla_ref, lon, lat,
-                     clientes_afectados, direcciones):
+                     clientes_afectados, direcciones, unidad_vecinal=None):
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO descargos_programados (
                 numpos, incidencia, tipo, tension, id_alim, h3_index,
-                en_malla_h3_referencia, lon, lat, descargo_codigo, fecha_inidesc,
+                en_malla_h3_referencia, unidad_vecinal, lon, lat, descargo_codigo, fecha_inidesc,
                 fecha_findesc, cli_plan, estadodesc, fecha_reposicion,
                 direcciones, clientes_afectados, primera_vez_visto,
                 ultima_vez_visto, activo
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
             ON CONFLICT (numpos) DO UPDATE SET
                 estadodesc = EXCLUDED.estadodesc,
                 fecha_reposicion = EXCLUDED.fecha_reposicion,
                 direcciones = EXCLUDED.direcciones,
                 clientes_afectados = EXCLUDED.clientes_afectados,
                 ultima_vez_visto = EXCLUDED.ultima_vez_visto,
+                unidad_vecinal = EXCLUDED.unidad_vecinal,
                 activo = 1,
                 fecha_resolucion_detectada = NULL
             """,
             (
                 numpos, props.get("INCIDENCIA"), props.get("TIPO"), props.get("TENSION"),
-                props.get("id_alim"), h3_index, int(en_malla_ref), lon, lat,
+                props.get("id_alim"), h3_index, int(en_malla_ref), unidad_vecinal, lon, lat,
                 props.get("DESCARGO"), props.get("FECHA_INIDESC"), props.get("FECHA_FINDESC"),
                 props.get("CLI_PLAN"), props.get("ESTADODESC"), props.get("FECHA_REPOSICION"),
                 direcciones, clientes_afectados, snapshot_ts, snapshot_ts,
@@ -597,12 +748,13 @@ def upsert_descargo(conn, snapshot_ts, numpos, props, h3_index, en_malla_ref, lo
             """
             INSERT INTO descargos_versiones (
                 snapshot_ts, numpos, incidencia, estadodesc, fecha_reposicion,
-                clientes_afectados, direcciones, h3_index, lon, lat
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                clientes_afectados, direcciones, h3_index, unidad_vecinal, lon, lat
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
                 snapshot_ts, numpos, props.get("INCIDENCIA"), props.get("ESTADODESC"),
-                props.get("FECHA_REPOSICION"), clientes_afectados, direcciones, h3_index, lon, lat,
+                props.get("FECHA_REPOSICION"), clientes_afectados, direcciones, h3_index,
+                unidad_vecinal, lon, lat,
             ),
         )
 
@@ -623,7 +775,7 @@ TABLAS_ESPERADAS = (
     "eventos", "historico_versiones",
     "trafos_afectados", "trafos_versiones",
     "descargos_programados", "descargos_versiones",
-    "estado_sistema", "dim_h3",
+    "estado_sistema", "comuna_estado", "dim_h3", "dim_unidad_vecinal",
 )
 
 
@@ -707,6 +859,40 @@ def poblar_dim_h3(conn):
     return nuevos
 
 
+def poblar_dim_unidad_vecinal(conn):
+    """Dimension Unidad Vecinal (modelo relacional, Fase 4): un registro por
+    cada uno de los 25 barrios, con un punto de referencia garantizado
+    dentro del poligono (representative_point(), igual criterio que el
+    filtro comunal) y su geometria completa como GeoJSON, para que
+    Superset/Power BI puedan mapear por poligono sin recalcularlo."""
+    unidades = cargar_unidades_vecinales()
+    with open(UNIDADES_VECINALES_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    geometria_por_codigo = {}
+    for feat in data.get("features", []):
+        match = re.search(r"VECINAL\s+(\S+)", feat.get("properties", {}).get("descriptio", ""))
+        codigo = match.group(1) if match else f"C-{feat.get('properties', {}).get('Name')}"
+        geometria_por_codigo[codigo] = json.dumps(feat["geometry"])
+
+    with conn.cursor() as cur:
+        for codigo, numero, poligono in unidades:
+            punto = poligono.representative_point()
+            cur.execute(
+                """
+                INSERT INTO dim_unidad_vecinal (codigo, numero, lat, lon, geometria_geojson)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT (codigo) DO UPDATE SET
+                    numero = EXCLUDED.numero,
+                    lat = EXCLUDED.lat,
+                    lon = EXCLUDED.lon,
+                    geometria_geojson = EXCLUDED.geometria_geojson
+                """,
+                (codigo, numero, punto.y, punto.x, geometria_por_codigo.get(codigo)),
+            )
+    conn.commit()
+    return len(unidades)
+
+
 def crear_vistas(conn):
     """Modelo relacional para visualizacion (Fase 4): vistas que unen los
     3 feeds via INCIDENCIA/COD_EVENTO (RF-05) y exponen un "hecho" unificado
@@ -742,19 +928,19 @@ def crear_vistas(conn):
                 'AVISO' AS tipo_fuente, cod_evento AS identificador, cod_evento AS incidencia,
                 h3_index, lat, lon, clientes_afectados, direccion AS direcciones,
                 fecha_ini AS fecha_inicio, fecha_reposicion_estimada, activo,
-                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada
+                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada, unidad_vecinal
             FROM eventos
             UNION ALL
             SELECT
                 'TRAFO', numpos, incidencia, h3_index, lat, lon, clientes_afectados,
                 direcciones, fecha_inicio, fecha_reposicion, activo,
-                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada
+                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada, unidad_vecinal
             FROM trafos_afectados
             UNION ALL
             SELECT
                 'DESCARGO', numpos, incidencia, h3_index, lat, lon, clientes_afectados,
                 direcciones, fecha_inidesc, fecha_reposicion, activo,
-                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada
+                primera_vez_visto, ultima_vez_visto, fecha_resolucion_detectada, unidad_vecinal
             FROM descargos_programados;
 
             CREATE OR REPLACE VIEW vw_duracion_cortes AS
@@ -785,6 +971,20 @@ def crear_vistas(conn):
             JOIN dim_h3 d ON d.h3_index = c.h3_index
             WHERE c.activo = 1
             GROUP BY c.h3_index, d.lat, d.lon, d.en_malla_referencia;
+
+            CREATE OR REPLACE VIEW vw_mapa_unidad_vecinal AS
+            SELECT
+                c.unidad_vecinal,
+                d.numero, d.lat, d.lon, d.geometria_geojson,
+                COUNT(*) AS n_registros,
+                COALESCE(SUM(c.clientes_afectados), 0) AS clientes_afectados_total,
+                SUM(CASE WHEN c.tipo_fuente = 'AVISO' THEN 1 ELSE 0 END) AS n_avisos,
+                SUM(CASE WHEN c.tipo_fuente = 'TRAFO' THEN 1 ELSE 0 END) AS n_trafos,
+                SUM(CASE WHEN c.tipo_fuente = 'DESCARGO' THEN 1 ELSE 0 END) AS n_descargos
+            FROM vw_cortes_unificado c
+            JOIN dim_unidad_vecinal d ON d.codigo = c.unidad_vecinal
+            WHERE c.activo = 1
+            GROUP BY c.unidad_vecinal, d.numero, d.lat, d.lon, d.geometria_geojson;
             """
         )
     conn.commit()
@@ -844,6 +1044,7 @@ def exportar_csv(conn):
                 id_alim AS "Alimentador",
                 h3_index AS "H3Index",
                 en_malla_h3_referencia AS "EnMallaH3Referencia",
+                unidad_vecinal AS "UnidadVecinal",
                 lat AS "Latitud",
                 lon AS "Longitud",
                 avisos_unicos AS "ClientesUnicos",
@@ -881,6 +1082,7 @@ def exportar_csv(conn):
                 id_alim AS "Alimentador",
                 h3_index AS "H3Index",
                 en_malla_h3_referencia AS "EnMallaH3Referencia",
+                unidad_vecinal AS "UnidadVecinal",
                 lat AS "Latitud",
                 lon AS "Longitud",
                 avisos_unicos AS "ClientesUnicos",
@@ -922,6 +1124,7 @@ def exportar_csv_trafos(conn):
                 id_alim AS "Alimentador",
                 h3_index AS "H3Index",
                 en_malla_h3_referencia AS "EnMallaH3Referencia",
+                unidad_vecinal AS "UnidadVecinal",
                 lat AS "Latitud",
                 lon AS "Longitud",
                 clientes_afectados AS "ClientesAfectados",
@@ -939,6 +1142,54 @@ def exportar_csv_trafos(conn):
         cols = [d[0] for d in cur.description]
         filas = cur.fetchall()
     _escribir_csv(CSV_TRAFOS_ACTIVOS_PATH, cols, filas)
+
+
+def exportar_csv_trafos_historico(conn):
+    """Igual que exportar_csv (mitad historico), para trafos_afectados:
+    incluye activos y resueltos, con Activo/FechaResolucionDetectada/
+    HorasActivo (congelada en la resolucion para los ya resueltos)."""
+    ahora = datetime.now()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                numpos AS "NumPos",
+                incidencia AS "Incidencia",
+                tipo AS "Tipo",
+                tension AS "Tension",
+                id_alim AS "Alimentador",
+                h3_index AS "H3Index",
+                en_malla_h3_referencia AS "EnMallaH3Referencia",
+                unidad_vecinal AS "UnidadVecinal",
+                lat AS "Latitud",
+                lon AS "Longitud",
+                clientes_afectados AS "ClientesAfectados",
+                direcciones AS "Direcciones",
+                estadoinc AS "EstadoIncidencia",
+                fecha_inicio AS "FechaInicio",
+                fecha_reposicion AS "FechaReposicionEstimada",
+                primera_vez_visto AS "PrimeraVezVisto",
+                ultima_vez_visto AS "UltimaVezVisto",
+                activo AS "Activo",
+                fecha_resolucion_detectada AS "FechaResolucionDetectada"
+            FROM trafos_afectados
+            ORDER BY primera_vez_visto DESC
+            """
+        )
+        cols = [d[0] for d in cur.description]
+        idx_fecha_ini = cols.index("FechaInicio")
+        idx_activo = cols.index("Activo")
+        idx_fecha_resolucion = cols.index("FechaResolucionDetectada")
+        filas = []
+        for fila in cur.fetchall():
+            fila = list(fila)
+            if fila[idx_activo]:
+                fin = ahora
+            else:
+                fin = _parsear_snapshot(fila[idx_fecha_resolucion]) or ahora
+            fila.append(_horas_activo(fila[idx_fecha_ini], fin))
+            filas.append(fila)
+    _escribir_csv(CSV_TRAFOS_HISTORICO_PATH, cols + ["HorasActivo"], filas)
 
 
 def _clasificar_descargo(fecha_inidesc_str, fecha_findesc_str, ahora):
@@ -970,6 +1221,7 @@ def exportar_csv_descargos(conn):
                 id_alim AS "Alimentador",
                 h3_index AS "H3Index",
                 en_malla_h3_referencia AS "EnMallaH3Referencia",
+                unidad_vecinal AS "UnidadVecinal",
                 lat AS "Latitud",
                 lon AS "Longitud",
                 clientes_afectados AS "ClientesAfectados",
@@ -996,6 +1248,74 @@ def exportar_csv_descargos(conn):
     _escribir_csv(CSV_DESCARGOS_PATH, cols + ["EstadoTemporal"], filas)
 
 
+def exportar_csv_descargos_activos(conn):
+    """Igual que exportar_csv_descargos, filtrado a solo los activos (misma
+    logica que trafos_activos/eventos_activos)."""
+    ahora = datetime.now()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                numpos AS "NumPos",
+                incidencia AS "Incidencia",
+                descargo_codigo AS "DescargoCodigo",
+                tipo AS "Tipo",
+                tension AS "Tension",
+                id_alim AS "Alimentador",
+                h3_index AS "H3Index",
+                en_malla_h3_referencia AS "EnMallaH3Referencia",
+                unidad_vecinal AS "UnidadVecinal",
+                lat AS "Latitud",
+                lon AS "Longitud",
+                clientes_afectados AS "ClientesAfectados",
+                direcciones AS "Direcciones",
+                estadodesc AS "EstadoDescargo",
+                fecha_inidesc AS "FechaInicioDescargo",
+                fecha_findesc AS "FechaFinDescargo",
+                fecha_reposicion AS "FechaReposicionEstimada",
+                primera_vez_visto AS "PrimeraVezVisto",
+                ultima_vez_visto AS "UltimaVezVisto"
+            FROM descargos_programados
+            WHERE activo = 1
+            ORDER BY fecha_inidesc DESC
+            """
+        )
+        cols = [d[0] for d in cur.description]
+        idx_inicio = cols.index("FechaInicioDescargo")
+        idx_fin = cols.index("FechaFinDescargo")
+        filas = []
+        for fila in cur.fetchall():
+            fila = list(fila)
+            fila.append(_clasificar_descargo(fila[idx_inicio], fila[idx_fin], ahora))
+            filas.append(fila)
+    _escribir_csv(CSV_DESCARGOS_ACTIVOS_PATH, cols + ["EstadoTemporal"], filas)
+
+
+def exportar_csv_comuna_estado(conn):
+    """Historial completo del resumen de la comuna (una fila por corrida),
+    el dato que el mapa de Enel muestra como "LAS_CONDES: N clientes
+    afectados (X%)"."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                snapshot_ts AS "SnapshotTs",
+                comuna AS "Comuna",
+                cod_vnr AS "CodVnr",
+                centro AS "Centro",
+                clientes_total AS "ClientesTotal",
+                clientes_afectados AS "ClientesAfectados",
+                porcentaje_enel AS "PorcentajeEnel",
+                porcentaje_calculado AS "PorcentajeCalculado"
+            FROM comuna_estado
+            ORDER BY snapshot_ts DESC
+            """
+        )
+        cols = [d[0] for d in cur.description]
+        filas = cur.fetchall()
+    _escribir_csv(CSV_COMUNA_ESTADO_PATH, cols, filas)
+
+
 def _escribir_csv(path, cols, filas):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f, delimiter=";")
@@ -1007,7 +1327,12 @@ def copiar_csv_a_onedrive():
     """Copia los CSV ya generados a la carpeta compartida de OneDrive.
     No debe interrumpir la corrida programada si OneDrive esta
     sincronizando y el destino queda momentaneamente bloqueado."""
-    for origen in (CSV_ACTIVOS_PATH, CSV_HISTORICO_PATH, CSV_TRAFOS_ACTIVOS_PATH, CSV_DESCARGOS_PATH):
+    for origen in (
+        CSV_ACTIVOS_PATH, CSV_HISTORICO_PATH,
+        CSV_TRAFOS_ACTIVOS_PATH, CSV_TRAFOS_HISTORICO_PATH,
+        CSV_DESCARGOS_PATH, CSV_DESCARGOS_ACTIVOS_PATH,
+        CSV_COMUNA_ESTADO_PATH,
+    ):
         destino = ONEDRIVE_DIR / origen.name
         try:
             shutil.copyfile(origen, destino)
@@ -1040,6 +1365,7 @@ def main():
 
     poligono_comunal = cargar_poligono_comunal()
     malla_h3_referencia = cargar_malla_h3()
+    unidades_vecinales = cargar_unidades_vecinales()
 
     # ------------------------------------------------------------------
     # Feed 1: avisos (critico - si falla, se aborta la corrida como antes)
@@ -1106,7 +1432,9 @@ def main():
         cod_avisos_por_evento.setdefault(cod_evento, set()).add(props.get("COD_AVISO"))
         ids_aviso_por_evento.setdefault(cod_evento, set()).add(props.get("ID_AVISO"))
 
-    filas_eventos = _preparar_filas(seleccionados, clientes_por_evento, cod_avisos_por_evento, ids_aviso_por_evento)
+    filas_eventos = _preparar_filas(
+        seleccionados, clientes_por_evento, cod_avisos_por_evento, ids_aviso_por_evento, unidades_vecinales
+    )
     cod_eventos_hoy = {fila[0] for fila in filas_eventos}
 
     # RF-05: direcciones/clientes de los avisos, indexados por COD_EVENTO/CODIGO,
@@ -1129,7 +1457,7 @@ def main():
             features_trafos, "TRAFO", poligono_comunal, malla_h3_referencia
         )
         logging.info("Trafos afectados dentro del limite oficial de Las Condes: %d", len(seleccionados_trafos))
-        filas_trafos = _preparar_filas_polygon(seleccionados_trafos, avisos_por_incidencia)
+        filas_trafos = _preparar_filas_polygon(seleccionados_trafos, avisos_por_incidencia, unidades_vecinales)
         numpos_trafos_hoy = {fila[0] for fila in filas_trafos}
     except Exception as e:
         logging.error("Error en el feed de trafos afectados (se omite esta corrida, no se marca nada como resuelto): %s", e)
@@ -1146,7 +1474,7 @@ def main():
             features_descargos, None, poligono_comunal, malla_h3_referencia
         )
         logging.info("Descargos dentro del limite oficial de Las Condes: %d", len(seleccionados_descargos))
-        filas_descargos = _preparar_filas_polygon(seleccionados_descargos, avisos_por_incidencia)
+        filas_descargos = _preparar_filas_polygon(seleccionados_descargos, avisos_por_incidencia, unidades_vecinales)
         numpos_descargos_hoy = {fila[0] for fila in filas_descargos}
     except Exception as e:
         logging.error("Error en el feed de descargos (se omite esta corrida, no se marca nada como resuelto): %s", e)
@@ -1163,6 +1491,20 @@ def main():
         logging.error("Error en el feed de estado del sistema (se omite esta corrida): %s", e)
 
     # ------------------------------------------------------------------
+    # Feed 5: resumen de la comuna (mismo criterio que el feed 4: si falla
+    # se omite esta corrida, no hay concepto de activo/resuelto)
+    # ------------------------------------------------------------------
+    comuna_row = None
+    try:
+        comuna_row = extraer_estado_comuna(descargar_comunas())
+        logging.info(
+            "Resumen de la comuna segun Enel: %s clientes afectados de %s (%s%%)",
+            comuna_row[4], comuna_row[3], comuna_row[5],
+        )
+    except Exception as e:
+        logging.error("Error en el feed de resumen de comunas (se omite esta corrida): %s", e)
+
+    # ------------------------------------------------------------------
     # Escritura: Postgres local (obligatorio) + replica best-effort a Supabase
     # ------------------------------------------------------------------
     conn = conectar_db()
@@ -1171,11 +1513,14 @@ def main():
             conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
             filas_trafos, numpos_trafos_hoy,
             filas_descargos, numpos_descargos_hoy,
-            estado_row,
+            estado_row, comuna_row,
         )
         exportar_csv(conn)
         exportar_csv_trafos(conn)
+        exportar_csv_trafos_historico(conn)
         exportar_csv_descargos(conn)
+        exportar_csv_descargos_activos(conn)
+        exportar_csv_comuna_estado(conn)
     finally:
         conn.close()
 
@@ -1183,7 +1528,7 @@ def main():
         snapshot_ts, filas_eventos, cod_eventos_hoy,
         filas_trafos, numpos_trafos_hoy,
         filas_descargos, numpos_descargos_hoy,
-        estado_row,
+        estado_row, comuna_row,
     )
 
     copiar_csv_a_onedrive()
@@ -1197,11 +1542,15 @@ def main():
     logging.info("CSV activos: %s", CSV_ACTIVOS_PATH)
     logging.info("CSV historico: %s", CSV_HISTORICO_PATH)
     logging.info("CSV trafos activos: %s", CSV_TRAFOS_ACTIVOS_PATH)
+    logging.info("CSV trafos historico: %s", CSV_TRAFOS_HISTORICO_PATH)
     logging.info("CSV descargos: %s", CSV_DESCARGOS_PATH)
+    logging.info("CSV descargos activos: %s", CSV_DESCARGOS_ACTIVOS_PATH)
+    logging.info("CSV resumen de la comuna: %s", CSV_COMUNA_ESTADO_PATH)
     logging.info("=== Ejecucion finalizada ===\n")
 
 
-def _preparar_filas(seleccionados, clientes_por_evento, cod_avisos_por_evento, ids_aviso_por_evento):
+def _preparar_filas(seleccionados, clientes_por_evento, cod_avisos_por_evento, ids_aviso_por_evento,
+                     unidades_vecinales=()):
     """Calcula, una sola vez, los valores agregados por evento
     (clientes_afectados, avisos_unicos, cod_avisos, ids_aviso) para no
     repetir el calculo al escribir tanto al Postgres local como a Supabase."""
@@ -1215,38 +1564,40 @@ def _preparar_filas(seleccionados, clientes_por_evento, cod_avisos_por_evento, i
         avisos_unicos = ",".join(str(c) for c in sorted(clientes_set, key=str))
         cod_avisos = ",".join(str(c) for c in sorted(cod_avisos_por_evento.get(cod_evento, set()), key=str))
         ids_aviso = ",".join(str(c) for c in sorted(ids_aviso_por_evento.get(cod_evento, set()), key=str))
+        unidad_vecinal = unidad_vecinal_de_punto(lat, lon, unidades_vecinales)
 
         filas.append((
             cod_evento, props, h3_index, en_malla_ref, lon, lat,
-            clientes_afectados, avisos_unicos, cod_avisos, ids_aviso,
+            clientes_afectados, avisos_unicos, cod_avisos, ids_aviso, unidad_vecinal,
         ))
     return filas
 
 
 def _escribir_eventos(conn, snapshot_ts, filas, cod_eventos_hoy):
     for (cod_evento, props, h3_index, en_malla_ref, lon, lat,
-         clientes_afectados, avisos_unicos, cod_avisos, ids_aviso) in filas:
+         clientes_afectados, avisos_unicos, cod_avisos, ids_aviso, unidad_vecinal) in filas:
         upsert_evento(
             conn, snapshot_ts, cod_evento, props, h3_index, en_malla_ref,
             lon, lat, clientes_afectados, avisos_unicos, cod_avisos, ids_aviso,
+            unidad_vecinal,
         )
     return marcar_resueltos(conn, cod_eventos_hoy, snapshot_ts)
 
 
 def _escribir_trafos(conn, snapshot_ts, filas, numpos_hoy):
-    for numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones in filas:
+    for numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones, unidad_vecinal in filas:
         upsert_trafo(
             conn, snapshot_ts, numpos, props, h3_index, en_malla_ref,
-            lon, lat, clientes_afectados, direcciones,
+            lon, lat, clientes_afectados, direcciones, unidad_vecinal,
         )
     return _marcar_resueltos_generico(conn, "trafos_afectados", "numpos", numpos_hoy, snapshot_ts)
 
 
 def _escribir_descargos(conn, snapshot_ts, filas, numpos_hoy):
-    for numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones in filas:
+    for numpos, props, h3_index, en_malla_ref, lon, lat, clientes_afectados, direcciones, unidad_vecinal in filas:
         upsert_descargo(
             conn, snapshot_ts, numpos, props, h3_index, en_malla_ref,
-            lon, lat, clientes_afectados, direcciones,
+            lon, lat, clientes_afectados, direcciones, unidad_vecinal,
         )
     return _marcar_resueltos_generico(conn, "descargos_programados", "numpos", numpos_hoy, snapshot_ts)
 
@@ -1254,7 +1605,7 @@ def _escribir_descargos(conn, snapshot_ts, filas, numpos_hoy):
 def _aplicar_corrida(conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
                       filas_trafos, numpos_trafos_hoy,
                       filas_descargos, numpos_descargos_hoy,
-                      estado_row):
+                      estado_row, comuna_row=None):
     """Aplica una corrida completa (los 4 feeds) sobre una conexion (local o
     Supabase). Los feeds cuyas filas sean `None` fallaron esta corrida y se
     omiten sin tocar su tabla (para no marcar como resueltos registros que
@@ -1274,12 +1625,20 @@ def _aplicar_corrida(conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
     if estado_row is not None:
         insertar_estado_sistema(conn, snapshot_ts, *estado_row)
 
+    if comuna_row is not None:
+        insertar_comuna_estado(conn, snapshot_ts, comuna_row)
+
     conn.commit()
 
     try:
         poblar_dim_h3(conn)
     except Exception as e:
         logging.error("Fallo poblar la dimension H3 (no afecta los datos de esta corrida): %s", e)
+
+    try:
+        poblar_dim_unidad_vecinal(conn)
+    except Exception as e:
+        logging.error("Fallo poblar la dimension Unidad Vecinal (no afecta los datos de esta corrida): %s", e)
 
     try:
         crear_vistas(conn)
@@ -1297,7 +1656,7 @@ def _aplicar_corrida(conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
 def _replicar_a_supabase(snapshot_ts, filas_eventos, cod_eventos_hoy,
                          filas_trafos, numpos_trafos_hoy,
                          filas_descargos, numpos_descargos_hoy,
-                         estado_row):
+                         estado_row, comuna_row=None):
     """Replica la misma corrida (los 4 feeds) a Supabase, para que Superset
     (u otro visualizador externo) pueda leerla. Es best-effort: si Supabase
     no esta configurado o falla la conexion/escritura, se loggea y se sigue
@@ -1316,7 +1675,7 @@ def _replicar_a_supabase(snapshot_ts, filas_eventos, cod_eventos_hoy,
             conn, snapshot_ts, filas_eventos, cod_eventos_hoy,
             filas_trafos, numpos_trafos_hoy,
             filas_descargos, numpos_descargos_hoy,
-            estado_row,
+            estado_row, comuna_row,
         )
         logging.info("Replica a Supabase completada")
     except Exception as e:

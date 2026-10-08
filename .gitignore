@@ -5,7 +5,10 @@ enel_las_condes_secrets.bat
 enel_las_condes_eventos_activos.csv
 enel_las_condes_eventos_historico.csv
 enel_las_condes_trafos_activos.csv
+enel_las_condes_trafos_historico.csv
 enel_las_condes_descargos.csv
+enel_las_condes_descargos_activos.csv
+enel_las_condes_comuna_estado.csv
 enel_las_condes_log.txt
 enel_las_condes_task_log.txt
 enel_las_condes_bat_error.log
